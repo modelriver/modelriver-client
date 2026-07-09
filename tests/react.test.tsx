@@ -66,14 +66,14 @@ describe('useModelRiver', () => {
       expect(result.current.hasPendingRequest).toBe(true);
     });
 
-    it('should set error for invalid token', () => {
+    it('should set error when wsToken is missing', () => {
       const { result } = renderHook(() => useModelRiver({ persist: false }));
 
       act(() => {
-        result.current.connect({ channelId: 'test-channel', wsToken: 'invalid' });
+        result.current.connect({ channelId: 'test-channel', wsToken: '' });
       });
 
-      expect(result.current.error).not.toBeNull();
+      expect(result.current.error).toBe('wsToken is required for WebSocket authentication');
       expect(result.current.connectionState).toBe('error');
     });
   });

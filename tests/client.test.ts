@@ -86,28 +86,22 @@ describe('ModelRiverClient', () => {
   });
 
   describe('connect', () => {
-    it('should emit error for invalid token', () => {
+    it('should emit error when wsToken is missing', () => {
       const errorHandler = vi.fn();
       client.on('error', errorHandler);
 
-      client.connect({ channelId: 'test-chan', wsToken: 'invalid-token' });
+      client.connect({ channelId: 'test-chan', wsToken: '' });
 
-      expect(errorHandler).toHaveBeenCalled();
+      expect(errorHandler).toHaveBeenCalledWith('wsToken is required for WebSocket authentication');
     });
 
-    it('should emit error for expired token', () => {
+    it('should emit error when channelId is missing', () => {
       const errorHandler = vi.fn();
       client.on('error', errorHandler);
 
-      const expiredToken = createTestToken({
-        project_id: 'proj-123',
-        channel_id: 'chan-456',
-        exp: Math.floor(Date.now() / 1000) - 3600, // Expired 1 hour ago
-      });
+      client.connect({ channelId: '', wsToken: validToken });
 
-      client.connect({ channelId: 'test-chan', wsToken: expiredToken });
-
-      expect(errorHandler).toHaveBeenCalledWith('Token has expired');
+      expect(errorHandler).toHaveBeenCalledWith('channelId is required');
     });
 
     it('should emit connecting event', () => {

@@ -1,6 +1,6 @@
 {
   "name": "@modelriver/client",
-  "version": "1.3.9",
+  "version": "1.4.0",
   "description": "Official ModelRiver client SDK for real-time AI response streaming via WebSockets",
   "author": "ModelRiver",
   "license": "MIT",
@@ -52,27 +52,28 @@
     "prepublishOnly": "npm run clean && npm run build && npm run build:cdn"
   },
   "dependencies": {
-    "phoenix": "^1.7.14"
+    "phoenix": "^1.8.9"
   },
   "devDependencies": {
-    "@rollup/plugin-commonjs": "^28.0.1",
-    "@rollup/plugin-node-resolve": "^15.3.0",
-    "@rollup/plugin-terser": "^0.4.4",
-    "@rollup/plugin-typescript": "^12.1.1",
-    "@testing-library/react": "^16.0.1",
-    "@types/node": "^22.10.2",
-    "@types/react": "^18.3.12",
-    "@vitejs/plugin-vue": "^5.2.1",
-    "jsdom": "^25.0.1",
-    "react": "^18.3.1",
-    "react-dom": "^18.3.1",
-    "rollup": "^4.28.1",
-    "rollup-plugin-dts": "^6.1.1",
-    "rxjs": "^7.8.1",
-    "svelte": "^5.14.1",
-    "typescript": "^5.7.2",
-    "vitest": "^2.1.8",
-    "vue": "^3.5.13"
+    "@rollup/plugin-commonjs": "^29.0.3",
+    "@rollup/plugin-node-resolve": "^16.0.3",
+    "@rollup/plugin-terser": "^1.0.0",
+    "@rollup/plugin-typescript": "^12.3.0",
+    "@testing-library/react": "^16.3.2",
+    "@types/node": "^22.20.1",
+    "@types/react": "^19.2.17",
+    "@types/react-dom": "^19.2.3",
+    "@vitejs/plugin-vue": "^6.0.7",
+    "jsdom": "^29.1.1",
+    "react": "^19.2.7",
+    "react-dom": "^19.2.7",
+    "rollup": "^4.62.2",
+    "rollup-plugin-dts": "^6.4.1",
+    "rxjs": "^7.8.2",
+    "svelte": "^5.56.4",
+    "typescript": "^5.9.3",
+    "vitest": "^4.1.10",
+    "vue": "^3.5.39"
   },
   "peerDependencies": {
     "react": ">=16.8.0",

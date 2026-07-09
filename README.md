@@ -27,7 +27,7 @@ pnpm add @modelriver/client
 ### CDN
 
 ```html
-<script src="https://cdn.modelriver.com/client/v1.3.9/modelriver.min.js"></script>
+<script src="https://cdn.modelriver.com/client/v1.4.0/modelriver.min.js"></script>
 <!-- or latest -->
 <script src="https://cdn.modelriver.com/client/latest/modelriver.min.js"></script>
 ```
@@ -364,7 +364,7 @@ interface ModelRiverClientOptions {
 
 | Method | Description |
 |--------|-------------|
-| `connect({ channelId, websocketUrl?, websocketChannel? })` | Connect to WebSocket with channel ID |
+| `connect({ channelId, wsToken, websocketUrl?, websocketChannel? })` | Connect to WebSocket with channel ID and one-time token |
 | `disconnect()` | Disconnect from WebSocket |
 | `reset()` | Reset state and clear stored data |
 | `reconnect()` | Reconnect using stored channel ID |
@@ -519,6 +519,14 @@ Never expose your ModelRiver API key in frontend code. Your backend should be th
 - Firefox 55+
 - Safari 12+
 - Edge 79+
+
+## Changelog
+
+### 1.4.0
+
+- Updated dependencies to latest stable versions (Phoenix.js 1.8.9, Vitest 4, TypeScript 5.9, jsdom 29, and related build tooling)
+- `connect()` requires `wsToken` from the `/api/v1/ai/async` response; the client validates presence of `channelId` and `wsToken` before connecting (token verification is handled server-side)
+- React adapter dev dependencies updated to React 19; peer dependency remains `react >= 16.8.0`
 
 ## License
 

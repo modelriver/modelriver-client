@@ -131,15 +131,16 @@ describe('localStorage helpers', () => {
 
   describe('saveActiveRequest', () => {
     it('should save request to localStorage', () => {
-      saveActiveRequest(prefix, 'proj-1', 'chan-1', 'token-1');
+      saveActiveRequest(prefix, 'chan-1', 'token-1', 'wss://api.modelriver.com/socket', 'ai_response:chan-1');
 
       const stored = localStorage.getItem(`${prefix}active_request`);
       expect(stored).toBeDefined();
 
       const parsed = JSON.parse(stored!);
-      expect(parsed.projectId).toBe('proj-1');
       expect(parsed.channelId).toBe('chan-1');
       expect(parsed.wsToken).toBe('token-1');
+      expect(parsed.websocketUrl).toBe('wss://api.modelriver.com/socket');
+      expect(parsed.websocketChannel).toBe('ai_response:chan-1');
       expect(parsed.timestamp).toBeDefined();
     });
   });
@@ -150,18 +151,18 @@ describe('localStorage helpers', () => {
     });
 
     it('should return stored request', () => {
-      saveActiveRequest(prefix, 'proj-1', 'chan-1', 'token-1');
+      saveActiveRequest(prefix, 'chan-1', 'token-1');
 
       const result = getActiveRequest(prefix);
 
       expect(result).not.toBeNull();
-      expect(result!.projectId).toBe('proj-1');
+      expect(result!.channelId).toBe('chan-1');
+      expect(result!.wsToken).toBe('token-1');
     });
 
     it('should return null for expired request', () => {
       // Manually save an old request
       const oldRequest = {
-        projectId: 'proj-1',
         channelId: 'chan-1',
         wsToken: 'token-1',
         timestamp: Date.now() - 400000, // 6+ minutes ago
@@ -174,7 +175,7 @@ describe('localStorage helpers', () => {
 
   describe('clearActiveRequest', () => {
     it('should remove stored request', () => {
-      saveActiveRequest(prefix, 'proj-1', 'chan-1', 'token-1');
+      saveActiveRequest(prefix, 'chan-1', 'token-1');
       clearActiveRequest(prefix);
 
       expect(localStorage.getItem(`${prefix}active_request`)).toBeNull();
