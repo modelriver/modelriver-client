@@ -1,6 +1,6 @@
 {
   "name": "@modelriver/client",
-  "version": "1.4.0",
+  "version": "1.5.0",
   "description": "Official ModelRiver client SDK for real-time AI response streaming via WebSockets",
   "author": "ModelRiver",
   "license": "MIT",
@@ -52,35 +52,35 @@
     "prepublishOnly": "npm run clean && npm run build && npm run build:cdn"
   },
   "dependencies": {
-    "phoenix": "^1.8.9"
+    "phoenix": "^1.8.15"
   },
   "devDependencies": {
     "@rollup/plugin-commonjs": "^29.0.3",
     "@rollup/plugin-node-resolve": "^16.0.3",
     "@rollup/plugin-terser": "^1.0.0",
     "@rollup/plugin-typescript": "^12.3.0",
-    "@testing-library/react": "^16.3.2",
-    "@types/node": "^22.20.1",
-    "@types/react": "^19.2.17",
-    "@types/react-dom": "^19.2.3",
-    "@vitejs/plugin-vue": "^6.0.7",
-    "jsdom": "^29.1.1",
-    "react": "^19.2.7",
-    "react-dom": "^19.2.7",
-    "rollup": "^4.62.2",
-    "rollup-plugin-dts": "^6.4.1",
+    "@testing-library/react": "^16.3.3",
+    "@types/node": "^26.6.3",
+    "@types/react": "^19.3.0",
+    "@types/react-dom": "^19.3.0",
+    "@vitejs/plugin-vue": "^6.0.9",
+    "jsdom": "^30.1.1",
+    "react": "^19.3.0",
+    "react-dom": "^19.3.0",
+    "rollup": "^4.63.5",
+    "rollup-plugin-dts": "^6.5.1",
     "rxjs": "^7.8.2",
-    "svelte": "^5.56.4",
+    "svelte": "^5.57.1",
     "typescript": "^5.9.3",
-    "vitest": "^4.1.10",
-    "vue": "^3.5.39"
+    "vitest": "^5.0.2",
+    "vue": "^3.5.43"
   },
   "peerDependencies": {
-    "react": ">=16.8.0",
-    "vue": ">=3.0.0",
     "@angular/core": ">=14.0.0",
+    "react": ">=16.8.0",
     "rxjs": ">=7.0.0",
-    "svelte": ">=3.0.0"
+    "svelte": ">=3.0.0",
+    "vue": ">=3.0.0"
   },
   "peerDependenciesMeta": {
     "react": {
