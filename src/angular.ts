@@ -126,7 +126,8 @@ export class ModelRiverService {
             this.client.disconnect();
           }
         } else {
-          this.hasPendingRequestSubject.next(false);
+          // Intermediate statuses (ai_generated, pipeline steps) keep the request pending
+          this.hasPendingRequestSubject.next(this.client?.hasPendingRequest() ?? false);
         }
       })
     );

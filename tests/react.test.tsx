@@ -5,6 +5,8 @@
 import { describe, it, expect, beforeEach, vi } from 'vitest';
 import { renderHook, act } from '@testing-library/react';
 import { useModelRiver } from '../src/react';
+import { ModelRiverClient } from '../src/client';
+import { saveActiveRequest } from '../src/utils';
 
 describe('useModelRiver', () => {
   // Create a valid test JWT
@@ -91,6 +93,31 @@ describe('useModelRiver', () => {
       });
 
       expect(result.current.hasPendingRequest).toBe(false);
+    });
+  });
+
+  describe('backend pipeline progress', () => {
+    it('should keep hasPendingRequest true on intermediate statuses', () => {
+      const onSpy = vi.spyOn(ModelRiverClient.prototype, 'on');
+      const { result } = renderHook(() =>
+        useModelRiver({ persist: true, storageKeyPrefix: 'test_modelriver' })
+      );
+
+      const responseHandler = onSpy.mock.calls.find(([event]) => event === 'response')?.[1] as
+        | ((data: unknown) => void)
+        | undefined;
+      expect(responseHandler).toBeDefined();
+
+      saveActiveRequest('test_modelriver', 'test-channel', validToken, 'wss://test.com/socket', 'test-channel');
+
+      act(() => {
+        responseHandler!({ status: 'step_ready', channel_id: 'test-channel', step_index: 0 });
+      });
+
+      expect(result.current.response?.status).toBe('step_ready');
+      expect(result.current.hasPendingRequest).toBe(true);
+
+      onSpy.mockRestore();
     });
   });
 

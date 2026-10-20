@@ -111,7 +111,8 @@ export function useModelRiver(
             client.disconnect();
           }
         } else {
-          hasPendingRequest.value = false;
+          // Intermediate statuses (ai_generated, pipeline steps) keep the request pending
+          hasPendingRequest.value = client?.hasPendingRequest() ?? false;
         }
       })
     );
