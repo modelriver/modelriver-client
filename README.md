@@ -489,6 +489,17 @@ interface WorkflowStep {
        │                      │                      │
 ```
 
+### Backend pipelines
+
+Workflows with backend steps send progress statuses while ModelRiver waits for your backend callbacks:
+
+- `ai_generated` - the AI step finished and the pipeline started
+- `step_ready` - ModelRiver sent a webhook and is waiting for your callback
+- `step_received`, `step_completed` - your callback was received and the step finished
+- `callback_ai_started`, `callback_ai_completed` - an AI step inside the pipeline is running or done
+
+The SDK keeps the connection open through these statuses, emits each one as a `response` event, and updates the `backend` step. The final result arrives with `status: "completed"`, after which the connection closes.
+
 ## Security
 
 The `/api/v1/ai/async` response contains:
@@ -521,6 +532,11 @@ Never expose your ModelRiver API key in frontend code. Your backend should be th
 - Edge 79+
 
 ## Changelog
+
+### 1.5.1
+
+- Fixed backend pipeline workflows: `step_ready`, `step_completed`, `step_received`, `callback_ai_started`, and `callback_ai_completed` no longer close the connection with "Unknown error". The SDK now waits for `completed`
+- Added `step_index`, `total_steps`, `step_type`, and `pipeline_workflow_name` to `AIResponse`
 
 ### 1.4.0
 
