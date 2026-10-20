@@ -29,6 +29,18 @@ import {
 } from './utils';
 
 /**
+ * Statuses sent between steps of a backend pipeline workflow.
+ * The workflow is still running, so the connection stays open until "completed".
+ */
+const PIPELINE_PROGRESS_STATUSES = new Set([
+  'step_ready',
+  'step_completed',
+  'step_received',
+  'callback_ai_started',
+  'callback_ai_completed',
+]);
+
+/**
  * ModelRiver WebSocket Client
  * 
  * Connects to ModelRiver's Phoenix Channels for real-time AI response streaming.
@@ -298,6 +310,35 @@ export class ModelRiverClient {
       this.emit('response', payload);
 
       // Don't close connection - keep waiting for final success/completed status
+      return;
+    }
+
+    // Handle backend pipeline progress statuses (intermediate states between steps)
+    if (PIPELINE_PROGRESS_STATUSES.has(payload.status)) {
+      this.logger.log(`Pipeline progress: ${payload.status}`);
+      this.logger.log(`Step: ${payload.event_name || 'N/A'} (${payload.step_index ?? 'N/A'}/${payload.total_steps ?? 'N/A'})`);
+
+      this.updateStepAndEmit('process', { status: 'success' });
+
+      const hasBackendStep = this.steps.some(s => s.id === 'backend');
+      if (!hasBackendStep) {
+        this.steps.push({
+          id: 'backend',
+          name: 'Backend processing...',
+          status: 'pending'
+        });
+      }
+      this.updateStepAndEmit('backend', {
+        status: 'pending',
+        name: payload.message || 'Backend processing...'
+      });
+
+      // Store intermediate response but don't mark as complete
+      this.response = payload;
+
+      this.emit('response', payload);
+
+      // Don't close connection - keep waiting for the final completed status
       return;
     }
 

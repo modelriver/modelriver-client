@@ -171,7 +171,11 @@ export interface ResponseError {
  * AI response payload from WebSocket
  */
 export interface AIResponse {
-  /** Response status ("success", "error", "ai_generated", or "completed") */
+  /**
+   * Response status: "success", "error", "ai_generated", "completed", or a backend
+   * pipeline progress status ("step_ready", "step_completed", "step_received",
+   * "callback_ai_started", "callback_ai_completed")
+   */
   status: string;
   /** Channel ID */
   channel_id?: string;
@@ -192,6 +196,14 @@ export interface AIResponse {
   };
   /** Event name (for event-driven workflows) */
   event_name?: string;
+  /** Current step position (for backend pipeline progress statuses) */
+  step_index?: number;
+  /** Total number of pipeline steps (for backend pipeline progress statuses) */
+  total_steps?: number;
+  /** Step type, "backend" or "callback_ai" (for backend pipeline progress statuses) */
+  step_type?: string;
+  /** Pipeline workflow name (for completed backend pipelines) */
+  pipeline_workflow_name?: string;
   /** Message (for intermediate statuses) */
   message?: string;
   /** Task ID (for event-driven workflows with callback) */

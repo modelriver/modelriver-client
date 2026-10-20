@@ -336,6 +336,82 @@ describe('ModelRiverClient', () => {
     });
   });
 
+  describe('backend pipeline progress statuses', () => {
+    const progressStatuses = [
+      'step_ready',
+      'step_completed',
+      'step_received',
+      'callback_ai_started',
+      'callback_ai_completed',
+    ];
+
+    it.each(progressStatuses)('should keep the connection open on %s', (status) => {
+      const testClient = new ModelRiverClient({
+        debug: false,
+        persist: true,
+        storageKeyPrefix: 'test_modelriver',
+      });
+
+      saveActiveRequest('test_modelriver', 'test-channel-id', 'test-token', 'test-url', 'test-channel');
+
+      const cleanupSpy = vi.spyOn(testClient as any, 'cleanupConnection');
+      const responseHandler = vi.fn();
+      testClient.on('response', responseHandler);
+
+      const payload = {
+        status,
+        channel_id: 'test-channel-id',
+        step_index: 0,
+        total_steps: 2,
+        event_name: 'lookup_order',
+        message: 'Waiting for backend callback at step lookup_order.',
+      };
+
+      (testClient as any).handleResponse(payload);
+
+      expect(cleanupSpy).not.toHaveBeenCalled();
+      expect(responseHandler).toHaveBeenCalledWith(payload);
+
+      const state = testClient.getState();
+      expect(state.error).toBeNull();
+      expect(state.response).toEqual(payload);
+      expect(state.hasPendingRequest).toBe(true);
+      expect(state.steps.find((s) => s.id === 'backend')).toMatchObject({
+        status: 'pending',
+        name: payload.message,
+      });
+    });
+
+    it('should finish on completed after a multi-step pipeline', () => {
+      const testClient = new ModelRiverClient({
+        debug: false,
+        persist: false,
+      });
+
+      const cleanupSpy = vi.spyOn(testClient as any, 'cleanupConnection');
+
+      (testClient as any).handleResponse({ status: 'ai_generated', channel_id: 'test-channel-id' });
+      (testClient as any).handleResponse({ status: 'step_ready', channel_id: 'test-channel-id', step_index: 0 });
+      (testClient as any).handleResponse({ status: 'step_completed', channel_id: 'test-channel-id', step_index: 0 });
+      (testClient as any).handleResponse({ status: 'step_ready', channel_id: 'test-channel-id', step_index: 1 });
+
+      expect(cleanupSpy).not.toHaveBeenCalled();
+
+      const completedPayload = {
+        status: 'completed',
+        channel_id: 'test-channel-id',
+        data: { order_status: 'shipped' },
+      };
+      (testClient as any).handleResponse(completedPayload);
+
+      expect(cleanupSpy).toHaveBeenCalled();
+      const state = testClient.getState();
+      expect(state.error).toBeNull();
+      expect(state.response).toEqual(completedPayload);
+      expect(state.steps.find((s) => s.id === 'backend')?.status).toBe('success');
+    });
+  });
+
   describe('reconnect method', () => {
     it('should not reconnect if response status is completed', () => {
       const persistentClient = new ModelRiverClient({
