@@ -3,6 +3,7 @@
  */
 
 import { describe, it, expect, beforeEach, vi, afterEach } from 'vitest';
+import { Socket } from 'phoenix';
 import { ModelRiverClient } from '../src/client';
 import { clearActiveRequest, saveActiveRequest, getActiveRequest } from '../src/utils';
 
@@ -595,5 +596,78 @@ describe('ModelRiverClient', () => {
       expect(connectSpy).not.toHaveBeenCalled();
     });
   });
-});
 
+  describe('stream events', () => {
+    // Join a channel on a mocked socket and return the handlers registered with channel.on
+    function joinWithHandlers(testClient: ModelRiverClient) {
+      (testClient as any).socket = new Socket('wss://example.test/socket');
+      (testClient as any).joinChannel('ai_response:project:channel');
+      const channel = (testClient as any).channel;
+      const handlers = new Map<string, (payload: unknown) => void>();
+      for (const [event, handler] of channel.on.mock.calls) handlers.set(event, handler);
+      return handlers;
+    }
+
+    it('should subscribe to stream events when joining a channel', () => {
+      const handlers = joinWithHandlers(new ModelRiverClient({ persist: false }));
+      expect([...handlers.keys()]).toEqual(
+        expect.arrayContaining(['response', 'error', 'stream_start', 'stream_delta', 'stream_done', 'stream_error'])
+      );
+    });
+
+    it('should emit deltas with the accumulated text', () => {
+      const testClient = new ModelRiverClient({ persist: false });
+      const handlers = joinWithHandlers(testClient);
+      const onDelta = vi.fn();
+      const onStart = vi.fn();
+      testClient.on('stream_start', onStart);
+      testClient.on('stream_delta', onDelta);
+
+      handlers.get('stream_start')!({ provider: 'openai', model: 'gpt-x' });
+      handlers.get('stream_delta')!({ text: 'Hel', index: 0 });
+      handlers.get('stream_delta')!({ text: 'lo', index: 1 });
+
+      expect(onStart).toHaveBeenCalledWith({ provider: 'openai', model: 'gpt-x' });
+      expect(onDelta).toHaveBeenNthCalledWith(1, { text: 'Hel', index: 0 }, 'Hel');
+      expect(onDelta).toHaveBeenNthCalledWith(2, { text: 'lo', index: 1 }, 'Hello');
+      expect(testClient.getState().streamText).toBe('Hello');
+    });
+
+    it('should use accumulated_text from stream_done', () => {
+      const testClient = new ModelRiverClient({ persist: false });
+      const handlers = joinWithHandlers(testClient);
+      const onDone = vi.fn();
+      testClient.on('stream_done', onDone);
+
+      handlers.get('stream_delta')!({ text: 'Hel' });
+      handlers.get('stream_done')!({ finish_reason: 'stop', accumulated_text: 'Hello there' });
+
+      expect(onDone).toHaveBeenCalledWith({ finish_reason: 'stop', accumulated_text: 'Hello there' });
+      expect(testClient.getState().streamText).toBe('Hello there');
+    });
+
+    it('should emit stream_error without closing the connection', () => {
+      const testClient = new ModelRiverClient({ persist: false });
+      const handlers = joinWithHandlers(testClient);
+      const onStreamError = vi.fn();
+      const cleanupSpy = vi.spyOn(testClient as any, 'cleanupConnection');
+      testClient.on('stream_error', onStreamError);
+
+      handlers.get('stream_error')!({ message: 'provider failed', recoverable: false });
+
+      expect(onStreamError).toHaveBeenCalledWith({ message: 'provider failed', recoverable: false });
+      // The final `response` event that follows owns error state and cleanup
+      expect(cleanupSpy).not.toHaveBeenCalled();
+    });
+
+    it('should reset streamed text on a new connection', () => {
+      const testClient = new ModelRiverClient({ persist: false });
+      const handlers = joinWithHandlers(testClient);
+      handlers.get('stream_delta')!({ text: 'old answer' });
+
+      testClient.connect({ channelId: 'next-channel', wsToken: 'next-token' });
+
+      expect(testClient.getState().streamText).toBe('');
+    });
+  });
+});

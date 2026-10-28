@@ -14,6 +14,10 @@ import type {
   WorkflowStep,
   AIResponse,
   ModelRiverState,
+  StreamStartPayload,
+  StreamDeltaPayload,
+  StreamDonePayload,
+  StreamErrorPayload,
 } from './types';
 import {
   DEFAULT_BASE_URL,
@@ -71,6 +75,7 @@ export class ModelRiverClient {
   private currentWebsocketChannel: string | null = null;
   private isConnecting = false;
   private isCompleted = false; // Flag to track if workflow is completed, preventing reconnection
+  private streamText = ''; // Text accumulated from stream_delta events
   private logger: ReturnType<typeof createLogger>;
 
   // Event listeners
@@ -105,6 +110,7 @@ export class ModelRiverClient {
       error: this.error,
       hasPendingRequest: this.hasPendingRequest(),
       isCompleted: this.isCompleted,
+      streamText: this.streamText,
     };
   }
 
@@ -154,6 +160,7 @@ export class ModelRiverClient {
     this.error = null;
     this.response = null;
     this.isCompleted = false; // Reset completed flag for new connection
+    this.streamText = '';
 
     // Save to localStorage for persistence
     if (this.options.persist) {
@@ -266,6 +273,32 @@ export class ModelRiverClient {
       const errorMsg = payload?.message || 'An error occurred';
       this.logger.error('Channel error:', errorMsg);
       this.handleError(errorMsg);
+    });
+
+    // Token streaming (requests sent with `stream: true`). The final `response`
+    // event still follows `stream_done` / `stream_error` and closes the request.
+    this.channel.on('stream_start', (payload: StreamStartPayload) => {
+      this.logger.log('Stream started:', payload);
+      this.streamText = '';
+      this.emit('stream_start', payload);
+    });
+
+    this.channel.on('stream_delta', (payload: StreamDeltaPayload) => {
+      this.streamText += payload?.text ?? '';
+      this.emit('stream_delta', payload, this.streamText);
+    });
+
+    this.channel.on('stream_done', (payload: StreamDonePayload) => {
+      this.logger.log('Stream done:', payload?.finish_reason);
+      if (typeof payload?.accumulated_text === 'string') {
+        this.streamText = payload.accumulated_text;
+      }
+      this.emit('stream_done', payload);
+    });
+
+    this.channel.on('stream_error', (payload: StreamErrorPayload) => {
+      this.logger.error('Stream error:', payload?.message);
+      this.emit('stream_error', payload);
     });
   }
 

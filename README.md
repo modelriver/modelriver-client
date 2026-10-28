@@ -5,6 +5,7 @@ Official ModelRiver client SDK for real-time AI response streaming via WebSocket
 ## Features
 
 - **WebSocket streaming** - Receive AI responses in real-time via Phoenix Channels
+- **Live sessions** - Follow a conversation as it happens: new turns, app signals and deletion (`subscribeToSession`)
 - **Auto-reconnection** - Automatically reconnects on connection loss
 - **Persistence + reconnect** - Survives page refreshes with localStorage + backend reconnect
 - **Framework adapters** - First-class support for React, Vue, Angular, and Svelte
@@ -27,7 +28,7 @@ pnpm add @modelriver/client
 ### CDN
 
 ```html
-<script src="https://cdn.modelriver.com/client/v1.4.0/modelriver.min.js"></script>
+<script src="https://cdn.modelriver.com/client/v1.7.0/modelriver.min.js"></script>
 <!-- or latest -->
 <script src="https://cdn.modelriver.com/client/latest/modelriver.min.js"></script>
 ```
@@ -81,6 +82,27 @@ client.connect({
   websocketChannel: websocket_channel,
 });
 ```
+
+### 3. Stream tokens as they arrive (optional)
+
+When your backend sends the async request with `"stream": true`, ModelRiver pushes the answer token by token before the final `response` event:
+
+```javascript
+client.on('stream_delta', (chunk, text) => {
+  // chunk.text is the new piece; text is everything streamed so far
+  renderAnswer(text);
+});
+
+client.on('stream_done', (done) => {
+  renderAnswer(done.accumulated_text);
+});
+
+client.on('stream_error', (err) => {
+  console.error('Stream failed:', err.message); // a final `response` with an error status follows
+});
+```
+
+The accumulated text is also available as `client.getState().streamText`.
 
 ## Framework Usage
 
@@ -387,6 +409,10 @@ interface ModelRiverClientOptions {
 | `step` | `WorkflowStep` | Workflow step updated |
 | `channel_joined` | - | Successfully joined channel |
 | `channel_error` | `reason: string` | Channel join failed |
+| `stream_start` | `StreamStartPayload` | Token streaming started (`stream: true` requests) |
+| `stream_delta` | `StreamDeltaPayload`, `text: string` | New chunk; second argument is the text accumulated so far |
+| `stream_done` | `StreamDonePayload` | Streaming finished; the final `response` event follows |
+| `stream_error` | `StreamErrorPayload` | Streaming failed; a final `response` with an error status follows |
 
 ### Types
 
@@ -454,7 +480,78 @@ interface WorkflowStep {
   duration?: number;
   errorMessage?: string;
 }
+
+// Token streaming events (requests sent with "stream": true)
+interface StreamStartPayload {
+  provider?: string;
+  model?: string;
+  request_id?: string;
+  session_id?: string;
+}
+
+interface StreamDeltaPayload {
+  text: string;                 // New text to append
+  index?: number;
+  request_id?: string;
+}
+
+interface StreamDonePayload {
+  finish_reason?: string;
+  accumulated_text?: string;    // Full streamed answer
+  usage?: { prompt_tokens?: number; completion_tokens?: number; total_tokens?: number };
+  duration_ms?: number;
+  request_id?: string;
+}
+
+interface StreamErrorPayload {
+  message: string;
+  code?: string;
+  recoverable?: boolean;
+  request_id?: string;
+}
 ```
+
+## Live Sessions
+
+For workflows with session memory, `subscribeToSession` follows one conversation as it happens: AI turns, user or human-agent turns your backend appends, signals your backend sends, and deletion. Use it to show an agent's reply in a customer's chat, or a customer's new message in your team's dashboard, without polling.
+
+Your backend asks ModelRiver for a single-use token with `POST /v1/sessions/:id/subscribe` (API key, server side only) and returns the response. The SDK calls your backend again for each reconnection.
+
+```typescript
+import { subscribeToSession } from '@modelriver/client';
+
+const subscription = subscribeToSession({
+  // Your route that checks the user may see this conversation, then calls
+  // POST /v1/sessions/:id/subscribe and returns the JSON as is.
+  getSubscription: () => fetch(`/api/chats/${chatId}/live`, { method: 'POST' }).then((r) => r.json()),
+
+  onMessage: (message) => addMessage(message), // merge by message.id
+  onSignal: (signal) => {
+    if (signal.name === 'agent.joined') showAgent(signal.data);
+  },
+  onDeleted: () => closeChat(),
+  // Joined (first time and after every reconnection). Events sent while
+  // disconnected aren't replayed, so reload the conversation here.
+  onLive: () => reloadMessages(),
+  onStatus: (status) => setConnectionBadge(status), // connecting | live | reconnecting | closed
+});
+
+// When the chat closes
+subscription.close();
+```
+
+| Option | Description |
+|--------|-------------|
+| `getSubscription` | Returns `{ ws_token, websocket_url, websocket_channel }` (camelCase works too) from your backend, or `null` when there's nothing to follow. Called for every (re)connection |
+| `onMessage(message)` | A new turn: `{ id, session_id, role, author: 'user' \| 'ai' \| 'agent', author_name, content, created_at }`. Ids match `GET /v1/sessions/:id` |
+| `onSignal(signal)` | `{ session_id, name, data, sent_at }`, sent by your backend with `POST /v1/sessions/:id/signals`. Not stored |
+| `onDeleted(payload)` | The session was deleted; the subscription closes |
+| `onLive()` | Joined, the first time and after each reconnection |
+| `onStatus(status)` | `connecting`, `live`, `reconnecting` or `closed` |
+| `onError(error)` | A connection or join failed. The subscription retries (1s, 2s, 5s, 10s, then every 30s) unless the session is gone or the token is for another session |
+| `retryDelaysMs` | Custom retry waits in ms; the last one repeats |
+
+Failed AI requests and test-mode runs aren't announced. Connections close after an hour and reconnect with a new token.
 
 ## How It Works
 
@@ -532,6 +629,17 @@ Never expose your ModelRiver API key in frontend code. Your backend should be th
 - Edge 79+
 
 ## Changelog
+
+### 1.7.0
+
+- Added `subscribeToSession` for live session updates: new turns (`message`), app-defined `signal`s and `deleted`, with single-use tokens fetched from your backend on every reconnection and backoff while it's unavailable
+- Exported the `SessionMessage`, `SessionSignal`, `SessionSubscription`, `SessionSubscriptionInfo`, `SessionSubscriptionOptions` and `SessionSubscriptionStatus` types
+
+### 1.6.0
+
+- Added token streaming events for async requests sent with `stream: true`: `stream_start`, `stream_delta` (with the accumulated text as a second argument), `stream_done` and `stream_error`
+- Added `streamText` to `getState()`, holding the text streamed so far for the current request
+- Exported the `StreamStartPayload`, `StreamDeltaPayload`, `StreamDonePayload` and `StreamErrorPayload` types
 
 ### 1.5.1
 

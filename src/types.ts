@@ -236,9 +236,54 @@ export interface ActiveRequest {
 }
 
 /**
+ * Sent once when a streaming request (`stream: true`) starts producing tokens
+ */
+export interface StreamStartPayload {
+  provider?: string;
+  model?: string;
+  request_id?: string;
+  session_id?: string;
+}
+
+/**
+ * One chunk of streamed text
+ */
+export interface StreamDeltaPayload {
+  /** Text to append */
+  text: string;
+  index?: number;
+  request_id?: string;
+}
+
+/**
+ * Sent when streaming finishes, just before the final `response` event
+ */
+export interface StreamDonePayload {
+  finish_reason?: string;
+  /** Full text of the streamed answer */
+  accumulated_text?: string;
+  usage?: TokenUsage;
+  duration_ms?: number;
+  request_id?: string;
+  data?: unknown;
+  customer_data?: Record<string, unknown>;
+  meta?: ResponseMeta;
+}
+
+/**
+ * Sent when streaming fails. A final `response` event with an error status follows.
+ */
+export interface StreamErrorPayload {
+  message: string;
+  code?: string;
+  recoverable?: boolean;
+  request_id?: string;
+}
+
+/**
  * Event types emitted by ModelRiverClient
  */
-export type ModelRiverEventType = 
+export type ModelRiverEventType =
   | 'connected'
   | 'disconnected'
   | 'response'
@@ -246,7 +291,11 @@ export type ModelRiverEventType =
   | 'step'
   | 'connecting'
   | 'channel_joined'
-  | 'channel_error';
+  | 'channel_error'
+  | 'stream_start'
+  | 'stream_delta'
+  | 'stream_done'
+  | 'stream_error';
 
 /**
  * Event listener callback types
@@ -260,6 +309,11 @@ export interface ModelRiverEventMap {
   connecting: () => void;
   channel_joined: () => void;
   channel_error: (reason: string) => void;
+  stream_start: (data: StreamStartPayload) => void;
+  /** Receives the chunk and the text accumulated so far */
+  stream_delta: (data: StreamDeltaPayload, text: string) => void;
+  stream_done: (data: StreamDonePayload) => void;
+  stream_error: (data: StreamErrorPayload) => void;
 }
 
 /**
@@ -282,6 +336,8 @@ export interface ModelRiverState {
   hasPendingRequest: boolean;
   /** Whether the workflow is completed (prevents reconnection) */
   isCompleted?: boolean;
+  /** Text streamed so far for the current request (`stream: true` requests only) */
+  streamText?: string;
 }
 
 /**
@@ -348,3 +404,75 @@ export interface ModelRiverSvelteStore {
   reset: () => void;
 }
 
+
+/**
+ * A conversation turn, as `GET /v1/sessions/:id` returns it.
+ */
+export interface SessionMessage {
+  /** Stable per turn (`"<log_id>:user"` / `"<log_id>:assistant"`): merge by id */
+  id: string;
+  session_id: string;
+  role: 'user' | 'assistant';
+  /** `ai` for model replies, `agent` for human replies appended through the API */
+  author: 'user' | 'ai' | 'agent';
+  author_name: string | null;
+  content: string;
+  created_at: string;
+}
+
+/**
+ * An app-defined event sent with `POST /v1/sessions/:id/signals`. Not stored.
+ */
+export interface SessionSignal<T = unknown> {
+  session_id: string;
+  name: string;
+  data: T;
+  sent_at: string;
+}
+
+/**
+ * What your backend returns from `POST /v1/sessions/:id/subscribe` (pass the
+ * API response through as is; camelCase keys work too).
+ */
+export interface SessionSubscriptionInfo {
+  ws_token?: string;
+  websocket_url?: string;
+  websocket_channel?: string;
+  wsToken?: string;
+  websocketUrl?: string;
+  websocketChannel?: string;
+}
+
+export type SessionSubscriptionStatus = 'connecting' | 'live' | 'reconnecting' | 'closed';
+
+export interface SessionSubscriptionOptions {
+  /**
+   * Fetches a fresh subscription from your backend. Called for the first
+   * connection and every reconnection (tokens are single-use). Return null
+   * when there is nothing to follow; the subscription then closes.
+   */
+  getSubscription: () => Promise<SessionSubscriptionInfo | null>;
+  /** A new turn: a user message, an AI reply or a human agent's reply */
+  onMessage?: (message: SessionMessage) => void;
+  /** A signal from your backend */
+  onSignal?: (signal: SessionSignal) => void;
+  /** The session was deleted; the subscription closes */
+  onDeleted?: (payload: { session_id: string }) => void;
+  /**
+   * Joined, first time and after every reconnection. Events sent while
+   * disconnected are not replayed, so reload the conversation here.
+   */
+  onLive?: () => void;
+  onStatus?: (status: SessionSubscriptionStatus) => void;
+  /** A failed connection or join (the subscription retries unless it's final) */
+  onError?: (error: Error) => void;
+  /** Waits between reconnection attempts in ms; the last one repeats. Default 1s, 2s, 5s, 10s, 30s */
+  retryDelaysMs?: number[];
+  debug?: boolean;
+}
+
+export interface SessionSubscription {
+  /** Stop following the session */
+  close: () => void;
+  readonly status: SessionSubscriptionStatus;
+}
