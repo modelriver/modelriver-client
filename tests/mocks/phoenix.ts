@@ -1,36 +1,67 @@
 /**
  * Mock Phoenix Socket for Testing
- * 
- * Provides a mock implementation of Phoenix Socket and Channel
- * for testing WebSocket functionality without a real connection.
+ *
+ * A Phoenix Socket/Channel double the tests can drive: open, close and fail
+ * sockets, answer joins and pushes with payloads, and deliver channel events.
+ *
+ * Use it in a test file with:
+ *   vi.mock('phoenix', async () => {
+ *     const { MockSocket, MockChannel } = await import('./mocks/phoenix');
+ *     return { Socket: MockSocket, Channel: MockChannel };
+ *   });
  */
 
 import { vi } from 'vitest';
 
 type Callback = (...args: any[]) => void;
+type ReplyStatus = 'ok' | 'error' | 'timeout';
+
+/**
+ * Mock Phoenix Push (what join() and push() return)
+ */
+export class MockPush {
+  event: string;
+  payload: unknown;
+  private hooks = new Map<ReplyStatus, Callback[]>();
+
+  constructor(event: string, payload?: unknown) {
+    this.event = event;
+    this.payload = payload;
+  }
+
+  receive(status: ReplyStatus, callback: Callback) {
+    if (!this.hooks.has(status)) this.hooks.set(status, []);
+    this.hooks.get(status)!.push(callback);
+    return this;
+  }
+
+  /** Answer the push, as the server would */
+  reply(status: ReplyStatus, payload?: unknown) {
+    this.hooks.get(status)?.forEach((cb) => cb(payload));
+  }
+}
 
 /**
  * Mock Phoenix Channel
  */
 export class MockChannel {
   topic: string;
+  params: unknown;
+  joinPush = new MockPush('phx_join');
+  /** Every push(), in order */
+  pushes: MockPush[] = [];
   private listeners: Map<string, Set<Callback>> = new Map();
-  private joinCallbacks: { ok?: Callback; error?: Callback; timeout?: Callback } = {};
 
-  constructor(topic: string) {
+  constructor(topic: string, params?: unknown) {
     this.topic = topic;
+    this.params = params;
   }
 
   /**
    * Join the channel
    */
   join() {
-    return {
-      receive: (status: 'ok' | 'error' | 'timeout', callback: Callback) => {
-        this.joinCallbacks[status] = callback;
-        return this;
-      },
-    };
+    return this.joinPush;
   }
 
   /**
@@ -41,32 +72,48 @@ export class MockChannel {
   /**
    * Subscribe to events
    */
-  on(event: string, callback: Callback) {
+  on = vi.fn((event: string, callback: Callback) => {
     if (!this.listeners.has(event)) {
       this.listeners.set(event, new Set());
     }
     this.listeners.get(event)!.add(callback);
-  }
+  });
 
   /**
    * Push message to channel
    */
-  push = vi.fn();
+  push = vi.fn((event: string, payload?: unknown) => {
+    const push = new MockPush(event, payload);
+    this.pushes.push(push);
+    return push;
+  });
 
   // Test helpers
 
+  /** Pushes sent with this event name */
+  pushesOf(event: string): MockPush[] {
+    return this.pushes.filter((p) => p.event === event);
+  }
+
   /**
-   * Simulate successful join
+   * Simulate successful join (optionally with a reply payload)
    */
-  simulateJoinOk() {
-    this.joinCallbacks.ok?.();
+  simulateJoinOk(payload?: unknown) {
+    this.joinPush.reply('ok', payload);
   }
 
   /**
    * Simulate join error
    */
   simulateJoinError(error: { reason?: string } = {}) {
-    this.joinCallbacks.error?.(error);
+    this.joinPush.reply('error', error);
+  }
+
+  /**
+   * Simulate join timeout
+   */
+  simulateJoinTimeout() {
+    this.joinPush.reply('timeout');
   }
 
   /**
@@ -95,9 +142,12 @@ export class MockChannel {
  * Mock Phoenix Socket
  */
 export class MockSocket {
+  /** Every socket built, in order (reset it in beforeEach) */
+  static instances: MockSocket[] = [];
+
   url: string;
   opts?: any;
-  private channels: Map<string, MockChannel> = new Map();
+  channels: MockChannel[] = [];
   private openCallbacks: Callback[] = [];
   private closeCallbacks: Callback[] = [];
   private errorCallbacks: Callback[] = [];
@@ -106,21 +156,16 @@ export class MockSocket {
   constructor(url: string, opts?: any) {
     this.url = url;
     this.opts = opts;
+    MockSocket.instances.push(this);
   }
 
   /**
-   * Connect to socket
+   * Connect to socket. Nothing happens until the test calls simulateOpen().
    */
-  connect = vi.fn(() => {
-    // Simulate async connection
-    setTimeout(() => {
-      this.connected = true;
-      this.openCallbacks.forEach((cb) => cb());
-    }, 0);
-  });
+  connect = vi.fn();
 
   /**
-   * Disconnect from socket
+   * Disconnect from socket. Like Phoenix, this fires the close callbacks.
    */
   disconnect = vi.fn(() => {
     this.connected = false;
@@ -149,16 +194,20 @@ export class MockSocket {
   }
 
   /**
-   * Get or create a channel
+   * Create a channel
    */
-  channel(topic: string) {
-    if (!this.channels.has(topic)) {
-      this.channels.set(topic, new MockChannel(topic));
-    }
-    return this.channels.get(topic)!;
+  channel(topic: string, params?: unknown) {
+    const channel = new MockChannel(topic, params);
+    this.channels.push(channel);
+    return channel;
   }
 
   // Test helpers
+
+  /** The token this socket was built with */
+  get token(): string | undefined {
+    return this.opts?.params?.token;
+  }
 
   /**
    * Simulate connection open
@@ -171,7 +220,7 @@ export class MockSocket {
   /**
    * Simulate connection close
    */
-  simulateClose(event: { code?: number; reason?: string } = {}) {
+  simulateClose(event: { code?: number; reason?: string } = { code: 1006 }) {
     this.connected = false;
     this.closeCallbacks.forEach((cb) => cb(event));
   }
@@ -184,10 +233,10 @@ export class MockSocket {
   }
 
   /**
-   * Get a channel for testing
+   * Get the latest channel for a topic
    */
   getChannel(topic: string): MockChannel | undefined {
-    return this.channels.get(topic);
+    return [...this.channels].reverse().find((c) => c.topic === topic);
   }
 
   /**
@@ -213,4 +262,3 @@ export function createMockPhoenix() {
     getCurrentSocket: () => currentSocket,
   };
 }
-

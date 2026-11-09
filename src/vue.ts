@@ -31,7 +31,7 @@
 
 import { ref, onMounted, onUnmounted } from 'vue';
 import { ModelRiverClient } from './client';
-import { clearActiveRequest } from './utils';
+import { clearStoredRequest } from './utils';
 import type {
   ModelRiverClientOptions,
   ConnectOptions,
@@ -62,6 +62,8 @@ export function useModelRiver(
   // Client instance
   let client: ModelRiverClient | null = null;
   const unsubscribers: (() => void)[] = [];
+  // Mount-time reconnect runs a tick later and is cancelled on unmount
+  let reconnectTimer: ReturnType<typeof setTimeout> | null = null;
 
   // Initialize client
   const initClient = () => {
@@ -93,6 +95,14 @@ export function useModelRiver(
     );
 
     unsubscribers.push(
+      client.on('reconnecting', () => {
+        connectionState.value = 'reconnecting';
+        isConnected.value = false;
+        isConnecting.value = false;
+      })
+    );
+
+    unsubscribers.push(
       client.on('response', (data) => {
         response.value = data;
         // Check for both 'completed' and 'success' statuses (both indicate workflow completion)
@@ -103,9 +113,7 @@ export function useModelRiver(
         if (isCompleted) {
           hasPendingRequest.value = false;
           // Clear from localStorage if persist is enabled
-          if (options.persist) {
-            clearActiveRequest(options.storageKeyPrefix || 'modelriver');
-          }
+          clearStoredRequest(options);
           // Disconnect immediately to prevent any further connection attempts
           if (client) {
             client.disconnect();
@@ -140,25 +148,22 @@ export function useModelRiver(
     if (currentState.isCompleted) {
       // Workflow is already completed, clear any pending request
       hasPendingRequest.value = false;
-      if (options.persist) {
-        clearActiveRequest(options.storageKeyPrefix || 'modelriver');
-      }
+      clearStoredRequest(options);
     } else if (client && client.hasPendingRequest()) {
       // Check if response status indicates completion (both 'completed' and 'success')
       const responseStatus = currentState.response?.status || currentState.response?.meta?.status;
       if (responseStatus === 'completed' || responseStatus === 'success' || responseStatus === 'SUCCESS') {
         // Response is already completed, clear the pending request
         hasPendingRequest.value = false;
-        if (options.persist) {
-          clearActiveRequest(options.storageKeyPrefix || 'modelriver');
-        }
+        clearStoredRequest(options);
       } else {
         // Not completed, safe to attempt reconnection
         hasPendingRequest.value = true;
-        // Attempt reconnection
-        if (client) {
-          client.reconnect();
-        }
+        // Attempt reconnection (false when the stored request can't be resumed)
+        reconnectTimer = setTimeout(() => {
+          reconnectTimer = null;
+          if (client && !client.reconnect()) hasPendingRequest.value = false;
+        }, 0);
       }
     }
   };
@@ -168,10 +173,15 @@ export function useModelRiver(
     unsubscribers.forEach((unsub) => unsub());
     unsubscribers.length = 0;
 
-    // Only destroy if there's no pending request and workflow is not already completed
+    if (reconnectTimer) clearTimeout(reconnectTimer);
+    reconnectTimer = null;
+
+    // A pending request stays stored (with its resume token) for the next
+    // mount or page load; otherwise release everything
     if (client) {
-      const state = client.getState();
-      if (!client.hasPendingRequest() && !state.isCompleted) {
+      if (client.hasPendingRequest()) {
+        client.detach();
+      } else {
         client.destroy();
       }
     }

@@ -29,6 +29,8 @@ export { subscribeToSession, DEFAULT_SESSION_RETRY_DELAYS_MS } from './session';
 export type {
   ModelRiverClientOptions,
   ConnectOptions,
+  ReconnectRequest,
+  ReconnectInfo,
   AsyncResponse,
   TokenPayload,
   WorkflowStep,

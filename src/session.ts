@@ -16,22 +16,13 @@ import type {
   SessionSubscriptionOptions,
   SessionSubscriptionStatus,
 } from './types';
-import { DEFAULT_BASE_URL } from './utils';
+import { DEFAULT_SESSION_RETRY_DELAYS_MS, readInfo, retireSocket } from './utils';
 
-/** Waits between reconnection attempts; the last one repeats. */
-export const DEFAULT_SESSION_RETRY_DELAYS_MS = [1_000, 2_000, 5_000, 10_000, 30_000];
+// Re-exported from here so existing imports keep working.
+export { DEFAULT_SESSION_RETRY_DELAYS_MS };
 
 // Join failures that a new token won't fix.
 const FINAL_JOIN_ERRORS = new Set(['session_not_found', 'unauthorized_session']);
-
-function readInfo(info: SessionSubscriptionInfo) {
-  const url = info.websocketUrl ?? info.websocket_url ?? DEFAULT_BASE_URL;
-  return {
-    socketUrl: url.endsWith('/socket') ? url : `${url}/socket`,
-    token: info.wsToken ?? info.ws_token,
-    topic: info.websocketChannel ?? info.websocket_channel,
-  };
-}
 
 /**
  * Subscribe to a session's live updates.
@@ -69,8 +60,8 @@ export function subscribeToSession(options: SessionSubscriptionOptions): Session
     generation++;
     const old = socket;
     socket = null;
-    // disconnect() also cancels phoenix's own reconnect, which would reuse the spent token.
-    old?.disconnect();
+    // Also cancels phoenix's own reconnect, which would reuse the spent token.
+    if (old) retireSocket(old);
   };
 
   const stop = () => {

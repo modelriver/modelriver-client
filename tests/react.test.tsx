@@ -2,11 +2,20 @@
  * React Hook Unit Tests
  */
 
-import { describe, it, expect, beforeEach, vi } from 'vitest';
+import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
+import { StrictMode } from 'react';
+
+// A Phoenix double the tests can drive (replies with payloads, open/close/error)
+vi.mock('phoenix', async () => {
+  const { MockSocket, MockChannel } = await import('./mocks/phoenix');
+  return { Socket: MockSocket, Channel: MockChannel };
+});
+
 import { renderHook, act } from '@testing-library/react';
 import { useModelRiver } from '../src/react';
 import { ModelRiverClient } from '../src/client';
-import { saveActiveRequest } from '../src/utils';
+import { saveActiveRequest, getActiveRequest } from '../src/utils';
+import { MockSocket } from './mocks/phoenix';
 
 describe('useModelRiver', () => {
   // Create a valid test JWT
@@ -147,6 +156,96 @@ describe('useModelRiver', () => {
 
       // Should not throw
       expect(() => unmount()).not.toThrow();
+    });
+  });
+
+  describe('resuming a stored request', () => {
+    const PREFIX = 'modelriver_'; // the default prefix
+    const TOPIC = 'ai_response:proj-1:chan-1';
+    const WS_URL = 'wss://mr.test/socket';
+
+    beforeEach(() => {
+      vi.useFakeTimers();
+      MockSocket.instances = [];
+    });
+
+    afterEach(() => {
+      vi.useRealTimers();
+      vi.restoreAllMocks();
+    });
+
+    it('spends the stored resume token exactly once under StrictMode', async () => {
+      saveActiveRequest(PREFIX, 'chan-1', 'resume-1', WS_URL, TOPIC);
+      const getToken = vi.fn();
+      const detachSpy = vi.spyOn(ModelRiverClient.prototype, 'detach');
+
+      const { result } = renderHook(() => useModelRiver({ getToken }), { wrapper: StrictMode });
+      await act(async () => {
+        await vi.advanceTimersByTimeAsync(0);
+      });
+
+      // StrictMode mounted, unmounted and remounted: the first client detached without a socket
+      expect(detachSpy).toHaveBeenCalledTimes(1);
+      expect(MockSocket.instances).toHaveLength(1);
+      expect(MockSocket.instances[0].token).toBe('resume-1');
+      expect(getToken).not.toHaveBeenCalled();
+      expect(result.current.hasPendingRequest).toBe(true);
+    });
+
+    it('detaches on unmount while pending: no timers left, stored request kept', async () => {
+      saveActiveRequest(PREFIX, 'chan-1', 'resume-1', WS_URL, TOPIC);
+      const { result, unmount } = renderHook(() => useModelRiver({}));
+      await act(async () => {
+        await vi.advanceTimersByTimeAsync(0);
+      });
+
+      const socket = MockSocket.instances[0];
+      act(() => {
+        socket.simulateOpen();
+        socket.getChannel(TOPIC)!.simulateJoinOk({ resume_token: 'resume-2' });
+      });
+      expect(result.current.connectionState).toBe('connected');
+      expect(vi.getTimerCount()).toBeGreaterThan(0); // heartbeat + token refresh
+
+      unmount();
+
+      expect(vi.getTimerCount()).toBe(0);
+      expect(socket.disconnect).toHaveBeenCalled();
+      expect(getActiveRequest(PREFIX)?.wsToken).toBe('resume-2');
+    });
+
+    it('shows the reconnecting state after a drop', async () => {
+      saveActiveRequest(PREFIX, 'chan-1', 'resume-1', WS_URL, TOPIC);
+      const { result } = renderHook(() => useModelRiver({}));
+      await act(async () => {
+        await vi.advanceTimersByTimeAsync(0);
+      });
+      const socket = MockSocket.instances[0];
+      act(() => {
+        socket.simulateOpen();
+        socket.getChannel(TOPIC)!.simulateJoinOk({ resume_token: 'resume-2' });
+      });
+
+      act(() => socket.simulateClose());
+
+      expect(result.current.connectionState).toBe('reconnecting');
+    });
+
+    it('clears the default-prefix stored request on a completed response', () => {
+      const onSpy = vi.spyOn(ModelRiverClient.prototype, 'on');
+      renderHook(() => useModelRiver({}));
+      const responseHandler = onSpy.mock.calls.find(([event]) => event === 'response')?.[1] as
+        | ((data: unknown) => void)
+        | undefined;
+
+      saveActiveRequest(PREFIX, 'chan-1', 'resume-1', WS_URL, TOPIC);
+      expect(getActiveRequest(PREFIX)).not.toBeNull();
+
+      act(() => {
+        responseHandler!({ status: 'completed', channel_id: 'chan-1' });
+      });
+
+      expect(localStorage.getItem('modelriver_active_request')).toBeNull();
     });
   });
 });

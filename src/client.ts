@@ -8,6 +8,8 @@ import { Socket, Channel } from 'phoenix';
 import type {
   ModelRiverClientOptions,
   ConnectOptions,
+  ReconnectInfo,
+  ReconnectRequest,
   ModelRiverEventType,
   ModelRiverEventMap,
   ConnectionState,
@@ -24,6 +26,12 @@ import {
   DEFAULT_STORAGE_KEY_PREFIX,
   DEFAULT_HEARTBEAT_INTERVAL,
   DEFAULT_REQUEST_TIMEOUT,
+  DEFAULT_SESSION_RETRY_DELAYS_MS,
+  DEFAULT_TOKEN_REFRESH_INTERVAL,
+  LISTENING_TOKEN_USABLE_MS,
+  RESUMABLE_REQUEST_MAX_AGE_MS,
+  readInfo,
+  retireSocket,
   saveActiveRequest,
   getActiveRequest,
   clearActiveRequest,
@@ -45,6 +53,52 @@ const PIPELINE_PROGRESS_STATUSES = new Set([
 ]);
 
 /**
+ * Join failures that a new token won't fix: stop instead of retrying.
+ * Any other join failure drops the socket and reconnects with a new token.
+ */
+const FINAL_JOIN_ERRORS = new Set([
+  'unauthorized_channel',
+  'unauthorized_project_access',
+  'unexpected_topic_format',
+]);
+
+/**
+ * Consecutive fetched tokens (from getToken or apiBaseUrl) that may fail to
+ * get the client joined before it gives up, so a broken token route or a
+ * server that keeps refusing the join can't loop forever.
+ */
+const MAX_FETCHED_TOKEN_FAILURES = 3;
+
+function isFinalJoinError(reason: string): boolean {
+  return FINAL_JOIN_ERRORS.has(reason) || reason.startsWith('invalid_');
+}
+
+/** A single-use listening token the client hasn't spent yet. */
+interface HeldToken {
+  value: string;
+  /** When ModelRiver issued it (ms); tokens expire 5 minutes later */
+  issuedAt: number;
+  /** Times a socket failed to open with it while the browser was online */
+  failures: number;
+  /** Fetched from getToken / apiBaseUrl (rather than a resume token) */
+  fetched?: boolean;
+}
+
+/** The async request the client is following. */
+interface RequestInfo {
+  channelId: string;
+  websocketUrl?: string;
+  websocketChannel?: string;
+}
+
+type ResolvedOptions = Required<Omit<ModelRiverClientOptions, 'getToken'>> &
+  Pick<ModelRiverClientOptions, 'getToken'>;
+
+function isOffline(): boolean {
+  return typeof navigator !== 'undefined' && navigator.onLine === false;
+}
+
+/**
  * ModelRiver WebSocket Client
  * 
  * Connects to ModelRiver's Phoenix Channels for real-time AI response streaming.
@@ -64,10 +118,12 @@ const PIPELINE_PROGRESS_STATUSES = new Set([
  * ```
  */
 export class ModelRiverClient {
-  private options: Required<ModelRiverClientOptions>;
+  private options: ResolvedOptions;
   private socket: Socket | null = null;
   private channel: Channel | null = null;
   private heartbeatInterval: ReturnType<typeof setInterval> | null = null;
+  private refreshTimer: ReturnType<typeof setInterval> | null = null;
+  private retryTimer: ReturnType<typeof setTimeout> | null = null;
   private connectionState: ConnectionState = 'disconnected';
   private steps: WorkflowStep[] = [];
   private response: AIResponse | null = null;
@@ -77,6 +133,25 @@ export class ModelRiverClient {
   private isCompleted = false; // Flag to track if workflow is completed, preventing reconnection
   private streamText = ''; // Text accumulated from stream_delta events
   private logger: ReturnType<typeof createLogger>;
+
+  // Reconnection state
+  /** The request being followed, kept so a reconnect can rejoin it */
+  private request: RequestInfo | null = null;
+  /** The next token to connect with: the latest resume token, not yet used */
+  private heldToken: HeldToken | null = null;
+  /** Tokens already spent (or given up on); never sent again */
+  private usedTokens = new Set<string>();
+  /** True once the request ended (terminal response, final error, manual disconnect) */
+  private stopped = true;
+  /** True once the channel was joined for the current request */
+  private hasJoined = false;
+  private retryAttempt = 0;
+  /** Consecutive fetched tokens that failed to get the client joined */
+  private fetchedTokenFailures = 0;
+  /** When the client last stopped being joined (null while joined) */
+  private unjoinedSince: number | null = null;
+  /** Bumped whenever a connection is abandoned, so its late callbacks are ignored */
+  private generation = 0;
 
   // Event listeners
   private listeners: Map<ModelRiverEventType, Set<Function>> = new Map();
@@ -89,12 +164,24 @@ export class ModelRiverClient {
       storageKeyPrefix: options.storageKeyPrefix ?? DEFAULT_STORAGE_KEY_PREFIX,
       heartbeatInterval: options.heartbeatInterval ?? DEFAULT_HEARTBEAT_INTERVAL,
       requestTimeout: options.requestTimeout ?? DEFAULT_REQUEST_TIMEOUT,
-      // Optional HTTP base URL for reconnect endpoint
+      // Optional HTTP base URL for the legacy reconnect route
       apiBaseUrl: options.apiBaseUrl ?? '',
+      getToken: options.getToken,
+      retryDelaysMs: options.retryDelaysMs?.length ? options.retryDelaysMs : DEFAULT_SESSION_RETRY_DELAYS_MS,
+      tokenRefreshInterval: options.tokenRefreshInterval ?? DEFAULT_TOKEN_REFRESH_INTERVAL,
     };
 
     this.logger = createLogger(this.options.debug);
-    this.logger.log('Client initialized with options:', this.options);
+    // Options hold no secrets, but log only what helps debugging
+    this.logger.log('Client initialized with options:', {
+      baseUrl: this.options.baseUrl,
+      persist: this.options.persist,
+      storageKeyPrefix: this.options.storageKeyPrefix,
+      apiBaseUrl: this.options.apiBaseUrl || undefined,
+      getToken: Boolean(this.options.getToken),
+      retryDelaysMs: this.options.retryDelaysMs,
+      tokenRefreshInterval: this.options.tokenRefreshInterval,
+    });
   }
 
   /**
@@ -119,8 +206,7 @@ export class ModelRiverClient {
    */
   hasPendingRequest(): boolean {
     if (!this.options.persist) return false;
-    const request = getActiveRequest(this.options.storageKeyPrefix);
-    return request !== null;
+    return this.getStoredRequest() !== null;
   }
 
   /**
@@ -143,133 +229,193 @@ export class ModelRiverClient {
       return;
     }
 
-    if (this.isConnecting) {
+    // A second connect() for the request already being (re)connected is a no-op;
+    // a different request replaces it
+    if (this.isConnecting && !this.stopped && this.request?.channelId === channelId) {
       this.logger.warn('Connection already in progress, skipping...');
       return;
     }
 
     this.isConnecting = true;
-    this.currentWebsocketChannel = websocketChannel || `ai_response:${channelId}`;
+    this.connectionState = 'connecting';
     this.emit('connecting');
 
-    // Clean up any existing connection
+    // Clean up any existing connection and pending retries
+    this.stopTimers();
     this.cleanupConnection();
 
-    // Initialize steps
+    // A new request: start from scratch
     this.steps = createInitialSteps();
     this.error = null;
     this.response = null;
     this.isCompleted = false; // Reset completed flag for new connection
     this.streamText = '';
+    this.startRequest({ channelId, websocketUrl, websocketChannel });
 
     // Save to localStorage for persistence
-    if (this.options.persist) {
-      saveActiveRequest(
-        this.options.storageKeyPrefix,
-        channelId,
-        wsToken,
-        websocketUrl,
-        websocketChannel
-      );
-    }
+    this.persistToken(wsToken);
 
     // Update queue step to pending
     this.updateStepAndEmit('queue', { status: 'pending' });
 
-    // Determine WebSocket URL
-    const wsUrl = websocketUrl || this.options.baseUrl;
-    const socketUrl = wsUrl.endsWith('/socket') ? wsUrl : `${wsUrl}/socket`;
+    this.openSocket({ value: wsToken, issuedAt: Date.now(), failures: 0 });
+  }
+
+  /**
+   * Reset the reconnection state for a request the client starts following
+   */
+  private startRequest(request: RequestInfo): void {
+    this.request = request;
+    this.currentWebsocketChannel = request.websocketChannel || `ai_response:${request.channelId}`;
+    this.heldToken = null;
+    this.usedTokens.clear();
+    this.stopped = false;
+    this.hasJoined = false;
+    this.retryAttempt = 0;
+    this.fetchedTokenFailures = 0;
+    this.unjoinedSince = Date.now();
+  }
+
+  /**
+   * Open a socket with a single-use token. Used by `connect()` and by every
+   * reconnect; unlike `connect()` it keeps steps, response and streamed text.
+   */
+  private openSocket(token: HeldToken): void {
+    if (!this.request) return;
+
+    const reconnecting = this.connectionState === 'reconnecting';
+    this.cleanupConnection();
+    const mine = ++this.generation;
+    this.isConnecting = true;
+    this.connectionState = reconnecting ? 'reconnecting' : 'connecting';
+
+    const { socketUrl } = readInfo({ websocketUrl: this.request.websocketUrl }, this.options.baseUrl);
     this.logger.log('Connecting to:', socketUrl);
 
     // Pass token to Phoenix Socket for authentication
-    this.socket = new Socket(socketUrl, {
-      params: { token: wsToken },
+    const socket = new Socket(socketUrl, {
+      params: { token: token.value },
     });
+    this.socket = socket;
 
-    this.socket.onOpen(() => {
+    let opened = false;
+    let lost = false;
+    const onLost = (reason: string) => {
+      if (lost || mine !== this.generation) return;
+      lost = true;
+      this.handleConnectionLost(reason, token, opened);
+    };
+
+    socket.onOpen(() => {
+      if (mine !== this.generation) return;
       this.logger.log('Socket connected');
+      // The server consumed the token when it accepted the socket: never send it again
+      opened = true;
+      this.usedTokens.add(token.value);
+      if (this.heldToken?.value === token.value) this.heldToken = null;
+      // Mark it spent in storage, unless another tab has stored a newer token since
+      if (this.options.persist) {
+        const stored = getActiveRequest(this.options.storageKeyPrefix, Number.POSITIVE_INFINITY);
+        if (!stored || stored.wsToken === token.value) this.persistToken('');
+      }
+
       this.connectionState = 'connected';
       this.isConnecting = false;
       this.emit('connected');
 
       // Join channel
-      this.joinChannel(this.currentWebsocketChannel!);
+      this.joinChannel(this.currentWebsocketChannel!, mine, onLost);
     });
 
-    this.socket.onError((error: unknown) => {
-      this.logger.error('Socket error:', error);
-
-      // Don't trigger error state or reconnection if workflow is already completed
-      if (this.isCompleted) {
-        this.logger.log('Workflow is already completed, ignoring socket error');
-        return;
-      }
-
-      this.connectionState = 'error';
-      this.isConnecting = false;
-      const errorMsg = 'WebSocket connection error';
-      this.setError(errorMsg);
-      this.updateStepAndEmit('queue', { status: 'error', errorMessage: errorMsg });
-      this.emit('error', errorMsg);
+    socket.onError((error: unknown) => {
+      if (mine !== this.generation) return;
+      this.logger.warn('Socket error:', error instanceof Error ? error.message : 'connection error');
+      onLost('socket error');
     });
 
-    this.socket.onClose((event: CloseEvent | unknown) => {
-      this.logger.log('Socket closed:', event);
-      this.connectionState = 'disconnected';
-      this.isConnecting = false;
-      this.stopHeartbeat();
-      this.emit('disconnected', 'Socket closed');
+    socket.onClose(() => {
+      if (mine !== this.generation) return;
+      this.logger.log('Socket closed');
+      onLost('socket closed');
     });
 
-    this.socket.connect();
+    socket.connect();
   }
 
   /**
    * Join the Phoenix channel
    */
-  private joinChannel(topic: string): void {
+  private joinChannel(
+    topic: string,
+    mine: number = this.generation,
+    onLost: (reason: string) => void = () => {}
+  ): void {
     if (!this.socket) return;
 
     this.logger.log('Joining channel:', topic);
-    this.channel = this.socket.channel(topic, {});
+    const channel = this.socket.channel(topic, {});
+    this.channel = channel;
 
-    this.channel.join()
-      .receive('ok', () => {
+    channel.join()
+      .receive('ok', (reply?: { resume_token?: unknown }) => {
+        if (mine !== this.generation) return;
         this.logger.log('Channel joined successfully');
-        this.updateStepAndEmit('queue', { status: 'success', duration: 100 });
-        this.updateStepAndEmit('process', { status: 'pending' });
-        this.updateStepAndEmit('receive', { status: 'pending' });
+        this.retryAttempt = 0;
+        this.fetchedTokenFailures = 0;
+        this.unjoinedSince = null;
+
+        // Older servers and console sockets send no resume token
+        const hasResumeToken = this.storeResumeToken(reply?.resume_token);
+
+        if (!this.hasJoined) {
+          this.hasJoined = true;
+          this.updateStepAndEmit('queue', { status: 'success', duration: 100 });
+          this.updateStepAndEmit('process', { status: 'pending' });
+          this.updateStepAndEmit('receive', { status: 'pending' });
+        }
         this.emit('channel_joined');
         this.startHeartbeat();
+        if (hasResumeToken) this.startTokenRefresh(channel, mine);
       })
       .receive('error', (error: { reason?: string }) => {
+        if (mine !== this.generation) return;
         const reason = error?.reason || 'unknown';
         this.logger.error('Channel join failed:', reason);
+        this.emit('channel_error', reason);
 
-        let errorMsg = 'Failed to join channel';
-        if (reason === 'unauthorized_project_access') {
-          errorMsg = 'Unauthorized: You do not have access to this project';
-        } else if (reason === 'invalid_channel_format') {
-          errorMsg = 'Invalid channel format';
-        } else if (reason === 'invalid_project_uuid' || reason === 'invalid_channel_uuid') {
-          errorMsg = 'Invalid project or channel ID';
-        } else if (reason !== 'unknown') {
-          errorMsg = `Channel join failed: ${reason}`;
+        if (isFinalJoinError(reason)) {
+          let errorMsg = `Channel join failed: ${reason}`;
+          if (reason === 'unauthorized_project_access') {
+            errorMsg = 'Unauthorized: You do not have access to this project';
+          } else if (reason === 'unauthorized_channel') {
+            errorMsg = 'Unauthorized: this token cannot join this channel';
+          } else if (reason === 'invalid_channel_format') {
+            errorMsg = 'Invalid channel format';
+          } else if (reason === 'invalid_project_uuid' || reason === 'invalid_channel_uuid') {
+            errorMsg = 'Invalid project or channel ID';
+          }
+          this.fail(errorMsg);
+          return;
         }
 
-        this.setError(errorMsg);
-        this.updateStepAndEmit('queue', { status: 'error', errorMessage: errorMsg });
-        this.emit('channel_error', reason);
+        // Phoenix would rejoin this socket on its own forever; reconnect with backoff instead
+        onLost(`join failed: ${reason}`);
+      })
+      .receive('timeout', () => {
+        if (mine !== this.generation) return;
+        onLost('join timeout');
       });
 
     // Listen for AI response
-    this.channel.on('response', (payload: AIResponse) => {
+    channel.on('response', (payload: AIResponse) => {
+      if (mine !== this.generation) return;
       this.logger.log('AI Response received:', payload);
       this.handleResponse(payload);
     });
 
     // Listen for errors
-    this.channel.on('error', (payload: { message?: string }) => {
+    channel.on('error', (payload: { message?: string }) => {
+      if (mine !== this.generation) return;
       const errorMsg = payload?.message || 'An error occurred';
       this.logger.error('Channel error:', errorMsg);
       this.handleError(errorMsg);
@@ -277,18 +423,21 @@ export class ModelRiverClient {
 
     // Token streaming (requests sent with `stream: true`). The final `response`
     // event still follows `stream_done` / `stream_error` and closes the request.
-    this.channel.on('stream_start', (payload: StreamStartPayload) => {
+    channel.on('stream_start', (payload: StreamStartPayload) => {
+      if (mine !== this.generation) return;
       this.logger.log('Stream started:', payload);
       this.streamText = '';
       this.emit('stream_start', payload);
     });
 
-    this.channel.on('stream_delta', (payload: StreamDeltaPayload) => {
+    channel.on('stream_delta', (payload: StreamDeltaPayload) => {
+      if (mine !== this.generation) return;
       this.streamText += payload?.text ?? '';
       this.emit('stream_delta', payload, this.streamText);
     });
 
-    this.channel.on('stream_done', (payload: StreamDonePayload) => {
+    channel.on('stream_done', (payload: StreamDonePayload) => {
+      if (mine !== this.generation) return;
       this.logger.log('Stream done:', payload?.finish_reason);
       if (typeof payload?.accumulated_text === 'string') {
         this.streamText = payload.accumulated_text;
@@ -296,10 +445,298 @@ export class ModelRiverClient {
       this.emit('stream_done', payload);
     });
 
-    this.channel.on('stream_error', (payload: StreamErrorPayload) => {
+    channel.on('stream_error', (payload: StreamErrorPayload) => {
+      if (mine !== this.generation) return;
       this.logger.error('Stream error:', payload?.message);
       this.emit('stream_error', payload);
     });
+  }
+
+  /**
+   * Keep a resume token from the server in memory and in storage.
+   * Returns false when the value isn't a token.
+   */
+  private storeResumeToken(value: unknown): boolean {
+    if (typeof value !== 'string' || !value) return false;
+    this.heldToken = { value, issuedAt: Date.now(), failures: 0 };
+    this.persistToken(value);
+    return true;
+  }
+
+  /**
+   * Ask the server for a fresh resume token every `tokenRefreshInterval`, so
+   * the one held is never close to its 5-minute expiry.
+   */
+  private startTokenRefresh(channel: Channel, mine: number): void {
+    this.stopTokenRefresh();
+    const interval = this.options.tokenRefreshInterval;
+    if (!(interval > 0)) return;
+
+    this.refreshTimer = setInterval(() => {
+      if (mine !== this.generation || this.stopped) {
+        this.stopTokenRefresh();
+        return;
+      }
+      channel
+        .push('refresh_token', {})
+        .receive('ok', (reply?: { resume_token?: unknown }) => {
+          if (mine !== this.generation || this.stopped) return;
+          this.storeResumeToken(reply?.resume_token);
+        })
+        .receive('error', (reply?: { reason?: string }) => {
+          // "not_supported" (not a token socket) or "unhandled_event" (older server)
+          if (mine !== this.generation) return;
+          this.logger.log('Token refresh unavailable:', reply?.reason ?? 'unknown');
+          this.stopTokenRefresh();
+        });
+    }, interval);
+  }
+
+  private stopTokenRefresh(): void {
+    if (this.refreshTimer) {
+      clearInterval(this.refreshTimer);
+      this.refreshTimer = null;
+    }
+  }
+
+  /**
+   * The socket closed or failed, or the join failed, before the request ended
+   */
+  private handleConnectionLost(reason: string, token: HeldToken, opened: boolean): void {
+    if (this.stopped || this.isCompleted) {
+      this.cleanupConnection();
+      return;
+    }
+    this.logger.log('Connection lost:', reason);
+    // The hour without a join counts from when the connection was lost, not from the last join
+    if (this.unjoinedSince === null) this.unjoinedSince = Date.now();
+
+    // A socket that never opened didn't spend its token: it can be tried again.
+    // While online that may mean the server refused it, so count the failure.
+    if (!opened && !this.usedTokens.has(token.value)) {
+      if (!isOffline()) token.failures++;
+      if (!this.heldToken) this.heldToken = token;
+    }
+
+    // A fetched token that was refused (or got a failed join) while online
+    const refused = !opened || reason.startsWith('join');
+    if (token.fetched && refused && !isOffline()) {
+      this.fetchedTokenFailures++;
+      if (this.fetchedTokenFailures >= MAX_FETCHED_TOKEN_FAILURES) {
+        this.fail(
+          `Could not rejoin the request: ${this.fetchedTokenFailures} new tokens in a row were refused`
+        );
+        return;
+      }
+    }
+
+    // disconnect() also cancels phoenix's own reconnect, which would reuse the spent token
+    this.cleanupConnection();
+    this.emit('disconnected', 'Connection lost');
+    this.scheduleReconnect();
+  }
+
+  /**
+   * Wait (with backoff), then reconnect with a new token
+   */
+  private scheduleReconnect(): void {
+    if (this.stopped) return;
+    this.clearRetryTimer();
+
+    // However retries fail (including a getToken that keeps throwing), stop once
+    // the client has gone this long without being joined
+    const unjoinedSince = this.unjoinedSince ?? Date.now();
+    if (Date.now() - unjoinedSince >= RESUMABLE_REQUEST_MAX_AGE_MS) {
+      this.fail('Could not reconnect to the request within an hour');
+      return;
+    }
+
+    const delays = this.options.retryDelaysMs;
+    const delay = delays[Math.min(this.retryAttempt, delays.length - 1)]!;
+    this.retryAttempt++;
+    this.connectionState = 'reconnecting';
+    this.isConnecting = false;
+    this.logger.log(`Reconnecting in ${delay}ms (attempt ${this.retryAttempt})`);
+    this.emit('reconnecting', this.retryAttempt, delay);
+    this.retryTimer = setTimeout(() => void this.attemptReconnect(), delay);
+  }
+
+  private clearRetryTimer(): void {
+    if (this.retryTimer) {
+      clearTimeout(this.retryTimer);
+      this.retryTimer = null;
+    }
+  }
+
+  /**
+   * Find a token and reconnect. Sources, in order:
+   * 1. the resume token held in memory or storage (each one used once);
+   * 2. `getToken`;
+   * 3. the legacy `apiBaseUrl` route.
+   * With none left, stop with an error instead of looping.
+   */
+  private async attemptReconnect(): Promise<void> {
+    this.retryTimer = null;
+    if (this.stopped || !this.request) return;
+    const mine = ++this.generation;
+
+    const held = this.takeUsableToken();
+    if (held) {
+      this.openSocket(held);
+      return;
+    }
+
+    const request: ReconnectRequest = {
+      channelId: this.request.channelId,
+      websocketChannel: this.request.websocketChannel,
+    };
+
+    let fetchToken: (() => Promise<ReconnectInfo | null>) | null = null;
+    if (this.options.getToken) {
+      const getToken = this.options.getToken;
+      fetchToken = () => getToken(request);
+    } else if (this.options.apiBaseUrl) {
+      fetchToken = () => this.fetchLegacyToken(request.channelId);
+    }
+
+    if (!fetchToken) {
+      this.fail(
+        'Connection lost and the client has no way to get a new token. ' +
+          'Pass getToken to ModelRiverClient to reconnect after longer gaps.'
+      );
+      return;
+    }
+
+    this.isConnecting = true;
+    let info: ReconnectInfo | null;
+    try {
+      info = await fetchToken();
+    } catch (error) {
+      if (mine !== this.generation || this.stopped) return;
+      this.logger.warn('Could not fetch a new token:', error instanceof Error ? error.message : 'unknown error');
+      this.scheduleReconnect();
+      return;
+    }
+    if (mine !== this.generation || this.stopped) return;
+
+    if (!info) {
+      this.fail('Connection lost and the request is no longer available');
+      return;
+    }
+
+    const { token, topic } = readInfo(info, this.options.baseUrl);
+    if (!token) {
+      this.fail('getToken must return ws_token (the /api/v1/ai/reconnect response)');
+      return;
+    }
+
+    const websocketUrl = info.websocketUrl ?? info.websocket_url;
+    this.request = {
+      channelId: this.request.channelId,
+      websocketUrl: websocketUrl ?? this.request.websocketUrl,
+      websocketChannel: topic ?? this.request.websocketChannel,
+    };
+    if (topic) this.currentWebsocketChannel = topic;
+    this.persistToken(token);
+    this.openSocket({ value: token, issuedAt: Date.now(), failures: 0, fetched: true });
+  }
+
+  /**
+   * The held (or stored) resume token, if one is still worth trying
+   */
+  private takeUsableToken(): HeldToken | null {
+    const canFetch = this.hasTokenSource();
+    const usable = (token: HeldToken) =>
+      !this.usedTokens.has(token.value) &&
+      Date.now() - token.issuedAt < LISTENING_TOKEN_USABLE_MS &&
+      // A token that failed to open while online was probably refused: with a
+      // way to fetch a new one, move on; without, keep trying until it expires.
+      (token.failures === 0 || !canFetch);
+
+    const held = this.heldToken;
+    this.heldToken = null;
+    if (held) {
+      if (usable(held)) return held;
+      this.usedTokens.add(held.value);
+    }
+
+    // After a reload, or a token another tab of this request stored
+    if (this.options.persist && this.request) {
+      const stored = this.getStoredRequest();
+      if (stored?.wsToken && stored.channelId === this.request.channelId) {
+        const token = { value: stored.wsToken, issuedAt: stored.timestamp, failures: 0 };
+        if (usable(token)) return token;
+      }
+    }
+    return null;
+  }
+
+  private hasTokenSource(): boolean {
+    return Boolean(this.options.getToken || this.options.apiBaseUrl);
+  }
+
+  /**
+   * The legacy route: POST `${apiBaseUrl}/api/v1/ai/reconnect` on your backend.
+   * 404 means the request is gone (null); other failures throw so the client retries.
+   */
+  private async fetchLegacyToken(channelId: string): Promise<ReconnectInfo | null> {
+    const base = this.options.apiBaseUrl.replace(/\/+$/, '');
+    const response = await fetch(`${base}/api/v1/ai/reconnect`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ channel_id: channelId }),
+    });
+
+    if (response.status === 404) return null;
+    if (!response.ok) {
+      throw new Error(`Backend reconnect failed with HTTP status ${response.status}`);
+    }
+    return (await response.json()) as ReconnectInfo;
+  }
+
+  /**
+   * Stop for good: no further reconnect attempts
+   */
+  private fail(errorMsg: string): void {
+    this.stopped = true;
+    this.stopTimers();
+    this.cleanupConnection();
+    this.heldToken = null;
+    this.isConnecting = false;
+    this.connectionState = 'error';
+
+    if (this.options.persist) {
+      clearActiveRequest(this.options.storageKeyPrefix);
+    }
+
+    this.setError(errorMsg);
+    const queue = this.steps.find((s) => s.id === 'queue');
+    const stepId = queue && queue.status === 'success' ? 'receive' : 'queue';
+    this.updateStepAndEmit(stepId, { status: 'error', errorMessage: errorMsg });
+    this.emit('error', errorMsg);
+  }
+
+  /**
+   * Save the request with the token to use next ('' once it's spent)
+   */
+  private persistToken(token: string): void {
+    if (!this.options.persist || !this.request) return;
+    saveActiveRequest(
+      this.options.storageKeyPrefix,
+      this.request.channelId,
+      token,
+      this.request.websocketUrl,
+      this.request.websocketChannel
+    );
+  }
+
+  /**
+   * The stored request. It stays resumable for longer when the client can
+   * fetch new tokens; otherwise only as long as its token lives.
+   */
+  private getStoredRequest() {
+    const maxAge = this.hasTokenSource() ? RESUMABLE_REQUEST_MAX_AGE_MS : DEFAULT_REQUEST_TIMEOUT;
+    return getActiveRequest(this.options.storageKeyPrefix, maxAge);
   }
 
   /**
@@ -390,6 +827,7 @@ export class ModelRiverClient {
 
       // Mark workflow as completed to prevent reconnection attempts
       this.isCompleted = true;
+      this.finishRequest();
 
       // Clear active request from localStorage BEFORE emitting response
       // This prevents auto-reconnection attempts after completion
@@ -437,6 +875,9 @@ export class ModelRiverClient {
       this.setError(errorMsg);
     }
 
+    // A final response (success or error): the server revoked the resume token
+    this.finishRequest();
+
     // Clear active request from localStorage
     if (this.options.persist) {
       clearActiveRequest(this.options.storageKeyPrefix);
@@ -464,18 +905,46 @@ export class ModelRiverClient {
   }
 
   /**
+   * The request reached its final response: stop timers and never reconnect
+   */
+  private finishRequest(): void {
+    this.stopped = true;
+    this.stopTimers();
+    this.heldToken = null;
+    this.isConnecting = false;
+  }
+
+  /**
    * Disconnect from WebSocket
    */
   disconnect(): void {
     this.logger.log('Disconnecting...');
+    this.stopped = true;
     this.isConnecting = false;
+    this.stopTimers();
     this.cleanupConnection();
+    this.heldToken = null;
 
     if (this.options.persist) {
       clearActiveRequest(this.options.storageKeyPrefix);
     }
 
     this.emit('disconnected', 'Manual disconnect');
+  }
+
+  /**
+   * Stop following the request in this client without ending it: closes the
+   * socket and stops all timers, but keeps the stored request and resume token
+   * so another client (a remounted component, a reloaded page) can resume it.
+   * The framework adapters call this on unmount while a request is pending.
+   */
+  detach(): void {
+    this.logger.log('Detaching...');
+    this.stopped = true;
+    this.isConnecting = false;
+    this.stopTimers();
+    this.cleanupConnection();
+    this.heldToken = null;
   }
 
   /**
@@ -488,10 +957,16 @@ export class ModelRiverClient {
     this.response = null;
     this.error = null;
     this.currentWebsocketChannel = null;
+    this.request = null;
+    this.usedTokens.clear();
   }
 
   /**
-   * Try to reconnect using stored channel ID
+   * Resume the request saved in localStorage (call it on page load).
+   *
+   * Reconnects with the stored resume token. If that token is missing, stale
+   * or refused, the client asks `getToken` (or the legacy `apiBaseUrl` route)
+   * for a new one. Returns true when a reconnection attempt started.
    */
   reconnect(): boolean {
     if (!this.options.persist) {
@@ -515,39 +990,66 @@ export class ModelRiverClient {
       return false;
     }
 
-    const activeRequest = getActiveRequest(this.options.storageKeyPrefix);
+    const activeRequest = this.getStoredRequest();
     if (!activeRequest) {
       this.logger.log('No active request found for reconnection');
       return false;
     }
 
-    if (!activeRequest.wsToken) {
-      this.logger.warn('No wsToken found in stored request, cannot reconnect');
+    const hasFreshToken =
+      Boolean(activeRequest.wsToken) && Date.now() - activeRequest.timestamp < LISTENING_TOKEN_USABLE_MS;
+    if (!hasFreshToken && !this.hasTokenSource()) {
+      this.logger.warn('No usable token stored and no getToken configured, cannot reconnect');
       clearActiveRequest(this.options.storageKeyPrefix);
       return false;
     }
 
-    this.logger.log('Reconnecting with stored channel ID...');
-    this.connect({
-      channelId: activeRequest.channelId,
-      wsToken: activeRequest.wsToken,
-      websocketUrl: activeRequest.websocketUrl,
-      websocketChannel: activeRequest.websocketChannel,
-    });
+    this.logger.log('Reconnecting to the stored request...');
+    this.resumeStoredRequest(activeRequest);
     return true;
   }
 
   /**
-   * Try to reconnect using your backend `/api/v1/ai/reconnect` endpoint.
+   * Start following a stored request again, keeping any steps already shown
+   */
+  private resumeStoredRequest(
+    activeRequest: {
+      channelId: string;
+      websocketUrl?: string;
+      websocketChannel?: string;
+    },
+    freshToken?: string
+  ): void {
+    this.stopTimers();
+    this.cleanupConnection();
+    this.error = null;
+    this.startRequest({
+      channelId: activeRequest.channelId,
+      websocketUrl: activeRequest.websocketUrl,
+      websocketChannel: activeRequest.websocketChannel,
+    });
+
+    this.isConnecting = true;
+    this.connectionState = 'connecting';
+    this.emit('connecting');
+    if (this.steps.length === 0) {
+      this.steps = createInitialSteps();
+      this.updateStepAndEmit('queue', { status: 'pending' });
+    }
+
+    if (freshToken) {
+      this.persistToken(freshToken);
+      this.openSocket({ value: freshToken, issuedAt: Date.now(), failures: 0, fetched: true });
+    } else {
+      void this.attemptReconnect();
+    }
+  }
+
+  /**
+   * Resume the stored request with a token from the legacy `apiBaseUrl` route.
    *
-   * This helper is intended for use with the official ModelRiver backend
-   * endpoint which issues a fresh one-time `ws_token` for an existing
-   * async request. It should be used instead of `reconnect()` in cases
-   * where WebSocket tokens are strictly single-use (the default).
-   *
-   * Requirements:
-   * - `persist` enabled (so the client can read the stored channel ID)
-   * - `apiBaseUrl` configured in `ModelRiverClientOptions`
+   * @deprecated Use `reconnect()` with the `getToken` option. `reconnect()`
+   * also falls back to `apiBaseUrl` on its own when `getToken` isn't set.
    *
    * Returns `true` if a reconnection attempt was started, `false` if no
    * pending request was found or configuration was missing.
@@ -563,69 +1065,36 @@ export class ModelRiverClient {
       return false;
     }
 
-    const activeRequest = getActiveRequest(this.options.storageKeyPrefix);
+    const activeRequest = this.getStoredRequest();
     if (!activeRequest) {
       this.logger.log('No active request found for backend reconnection');
       return false;
     }
 
-    const base = this.options.apiBaseUrl.replace(/\/+$/, '');
-    const url = `${base}/api/v1/ai/reconnect`;
-
+    let info: ReconnectInfo | null;
     try {
-      const response = await fetch(url, {
-        method: 'POST',
-        headers: {
-          'Content-Type': 'application/json',
-        },
-        body: JSON.stringify({
-          channel_id: activeRequest.channelId,
-        }),
-      });
-
-      if (!response.ok) {
-        this.logger.error('Backend reconnect failed with HTTP status', response.status);
-        return false;
-      }
-
-      const data = (await response.json()) as {
-        channel_id: string;
-        project_id: string;
-        ws_token: string;
-        websocket_url: string;
-        websocket_channel: string;
-      };
-
-      if (!data?.channel_id || !data?.ws_token) {
-        this.logger.error(
-          'Backend reconnect response missing channel_id or ws_token',
-          data
-        );
-        return false;
-      }
-
-      // Save updated request to localStorage for future persistence
-      saveActiveRequest(
-        this.options.storageKeyPrefix,
-        data.channel_id,
-        data.ws_token,
-        data.websocket_url,
-        data.websocket_channel
-      );
-
-      // Initiate WebSocket reconnection with the fresh token
-      this.connect({
-        channelId: data.channel_id,
-        wsToken: data.ws_token,
-        websocketUrl: data.websocket_url,
-        websocketChannel: data.websocket_channel,
-      });
-
-      return true;
+      info = await this.fetchLegacyToken(activeRequest.channelId);
     } catch (error) {
-      this.logger.error('Backend reconnect request failed', error);
+      this.logger.error('Backend reconnect request failed:', error instanceof Error ? error.message : 'unknown error');
       return false;
     }
+
+    const { token, topic } = readInfo(info ?? {}, this.options.baseUrl);
+    if (!info || !token) {
+      this.logger.error('Backend reconnect returned no ws_token');
+      return false;
+    }
+
+    // Use the fresh token right away instead of any stored one
+    this.resumeStoredRequest(
+      {
+        channelId: activeRequest.channelId,
+        websocketUrl: info.websocketUrl ?? info.websocket_url ?? activeRequest.websocketUrl,
+        websocketChannel: topic ?? activeRequest.websocketChannel,
+      },
+      token
+    );
+    return true;
   }
 
   /**
@@ -716,20 +1185,28 @@ export class ModelRiverClient {
   }
 
   /**
+   * Stop the heartbeat, token refresh and pending reconnect
+   */
+  private stopTimers(): void {
+    this.stopHeartbeat();
+    this.stopTokenRefresh();
+    this.clearRetryTimer();
+  }
+
+  /**
    * Clean up connection resources
    */
   private cleanupConnection(): void {
     this.stopHeartbeat();
+    this.stopTokenRefresh();
 
-    // If workflow is completed, socket is already closed, skip socket operations
-    // This prevents errors when trying to disconnect an already-closed connection
-    const skipSocketOps = this.isCompleted;
+    // Ignore late callbacks from the socket being dropped (including the
+    // close event that disconnect() itself triggers)
+    this.generation++;
 
     if (this.channel) {
       try {
-        if (!skipSocketOps) {
-          this.channel.leave();
-        }
+        this.channel.leave();
       } catch {
         // Ignore errors during cleanup
       }
@@ -738,9 +1215,8 @@ export class ModelRiverClient {
 
     if (this.socket) {
       try {
-        if (!skipSocketOps) {
-          this.socket.disconnect();
-        }
+        // Also cancels phoenix's own reconnect, which would resend a spent token
+        retireSocket(this.socket);
       } catch {
         // Ignore errors during cleanup
       }

@@ -6,8 +6,8 @@ Official ModelRiver client SDK for real-time AI response streaming via WebSocket
 
 - **WebSocket streaming** - Receive AI responses in real-time via Phoenix Channels
 - **Live sessions** - Follow a conversation as it happens: new turns, app signals and deletion (`subscribeToSession`)
-- **Auto-reconnection** - Automatically reconnects on connection loss
-- **Persistence + reconnect** - Survives page refreshes with localStorage + backend reconnect
+- **Automatic reconnect** - Rejoins an async request on its own after network drops, ModelRiver's 1-hour connection cutoff and page reloads within about 5 minutes, using single-use resume tokens (no backend route needed)
+- **Longer gaps** - An optional `getToken` callback to your backend covers longer gaps and ModelRiver restarts (see [Reconnecting](#reconnecting))
 - **Framework adapters** - First-class support for React, Vue, Angular, and Svelte
 - **CDN ready** - Use via script tag without a build step
 - **TypeScript** - Full type definitions included
@@ -28,7 +28,7 @@ pnpm add @modelriver/client
 ### CDN
 
 ```html
-<script src="https://cdn.modelriver.com/client/v1.7.0/modelriver.min.js"></script>
+<script src="https://cdn.modelriver.com/client/v1.8.0/modelriver.min.js"></script>
 <!-- or latest -->
 <script src="https://cdn.modelriver.com/client/latest/modelriver.min.js"></script>
 ```
@@ -373,7 +373,11 @@ export class ChatComponent implements OnDestroy {
 ```typescript
 interface ModelRiverClientOptions {
   baseUrl?: string;           // WebSocket URL (default: 'wss://api.modelriver.com/socket')
-  apiBaseUrl?: string;        // Optional HTTP base URL for backend reconnect (/api/v1/ai/reconnect)
+  getToken?: (request: { channelId: string; websocketChannel?: string }) =>
+    Promise<ReconnectInfo | null>; // New token from your backend for longer gaps (see Reconnecting)
+  retryDelaysMs?: number[];   // Waits between reconnect attempts (default: [1000, 2000, 5000, 10000, 30000]; the last repeats)
+  tokenRefreshInterval?: number; // How often to rotate the resume token in ms (default: 120000; 0 turns it off)
+  apiBaseUrl?: string;        // Deprecated: use getToken. POSTs to `${apiBaseUrl}/api/v1/ai/reconnect` on your backend
   debug?: boolean;            // Enable debug logging (default: false)
   persist?: boolean;          // Enable localStorage persistence (default: true)
   storageKeyPrefix?: string;  // Storage key prefix (default: 'modelriver_')
@@ -389,8 +393,9 @@ interface ModelRiverClientOptions {
 | `connect({ channelId, wsToken, websocketUrl?, websocketChannel? })` | Connect to WebSocket with channel ID and one-time token |
 | `disconnect()` | Disconnect from WebSocket |
 | `reset()` | Reset state and clear stored data |
-| `reconnect()` | Reconnect using stored channel ID |
-| `reconnectWithBackend()` | Call your backend `/api/v1/ai/reconnect` to get a fresh `ws_token` and reconnect |
+| `detach()` | (1.8.0+) Close the socket and stop all timers but keep the stored request and resume token, so another client or the next page load can resume it. The React, Vue and Angular adapters call it on unmount while a request is pending |
+| `reconnect()` | Resume the request stored in `localStorage` (call it on page load; the framework adapters do). Uses the stored resume token, then `getToken` if that token is stale or refused. Returns `false` when there's nothing to resume |
+| `reconnectWithBackend()` | Deprecated: use `reconnect()` with `getToken`. Gets a token from `${apiBaseUrl}/api/v1/ai/reconnect` on your backend and reconnects |
 | `getState()` | Get current client state |
 | `hasPendingRequest()` | Check if there's a pending request |
 | `on(event, callback)` | Add event listener (returns unsubscribe function) |
@@ -403,9 +408,10 @@ interface ModelRiverClientOptions {
 |-------|---------|-------------|
 | `connecting` | - | Connection attempt started |
 | `connected` | - | Successfully connected |
-| `disconnected` | `reason?: string` | Disconnected from WebSocket |
+| `disconnected` | `reason?: string` | Disconnected from WebSocket (`'Connection lost'` before an automatic reconnect) |
+| `reconnecting` | `attempt: number`, `delayMs: number` | (1.8.0+) The connection dropped; the next attempt starts in `delayMs` |
 | `response` | `AIResponse` | AI response received |
-| `error` | `Error` or `string` | Error occurred |
+| `error` | `Error` or `string` | Error occurred. Connection errors are only reported once the client has stopped retrying |
 | `step` | `WorkflowStep` | Workflow step updated |
 | `channel_joined` | - | Successfully joined channel |
 | `channel_error` | `reason: string` | Channel join failed |
@@ -414,9 +420,20 @@ interface ModelRiverClientOptions {
 | `stream_done` | `StreamDonePayload` | Streaming finished; the final `response` event follows |
 | `stream_error` | `StreamErrorPayload` | Streaming failed; a final `response` with an error status follows |
 
+`getState().connectionState` is one of `'disconnected'`, `'connecting'`, `'connected'`, `'reconnecting'` (1.8.0+) or `'error'`.
+
 ### Types
 
 ```typescript
+// What getToken returns: ModelRiver's /v1/ai/reconnect JSON as is (camelCase works too)
+interface ReconnectInfo {
+  channel_id?: string;
+  project_id?: string;
+  ws_token?: string;
+  websocket_url?: string;
+  websocket_channel?: string;
+}
+
 // Response from /api/ai/async endpoint
 interface AsyncResponse {
   message: string;              // "success"
@@ -553,6 +570,70 @@ subscription.close();
 
 Failed AI requests and test-mode runs aren't announced. Connections close after an hour and reconnect with a new token.
 
+## Reconnecting
+
+Listening tokens are single-use: ModelRiver consumes a `ws_token` when a socket connects with it. So after joining, ModelRiver hands the client its next token, a **resume token**, over the channel it already authenticated, and the client asks for a fresh one every 2 minutes. When the connection drops, the client reconnects with that token and backoff (1s, 2s, 5s, 10s, then every 30s).
+
+**Reconnects on its own** (no backend route needed):
+
+- Network drops (Wi-Fi blips, going offline and back)
+- ModelRiver's 1-hour connection cutoff
+- Page reloads within about 5 minutes: the resume token is kept in `localStorage` (with `persist`, the default), and `reconnect()` uses it on load. The framework adapters call `reconnect()` on mount
+
+**Needs `getToken`:**
+
+- Gaps longer than about 5 minutes (a closed tab, a laptop asleep): resume tokens expire 5 minutes after they're issued
+- ModelRiver deploys and restarts: tokens live in server memory, so a restart erases them
+
+Without `getToken`, the client stops with a clear `error` once it has no usable token. It doesn't retry forever. With `getToken`, it also stops after 3 new tokens in a row fail to get it rejoined, or after an hour without a successful join (a `getToken` that throws is retried until then).
+
+What happens during a gap: `stream_delta` events sent while disconnected are lost (`getState().streamText` keeps what arrived before the drop). The final `response` is buffered on the server for 10 minutes and delivered when the client rejoins.
+
+### getToken
+
+`getToken` asks your backend for a new token. Your backend calls ModelRiver's `POST /v1/ai/reconnect` with its API key and returns the JSON as is. Return `null` when the request is gone (ModelRiver answered 404): the client stops with an error. Throw for anything temporary: the client waits and tries again.
+
+```typescript
+const client = new ModelRiverClient({
+  getToken: async ({ channelId }) => {
+    const res = await fetch(`/api/ai/requests/${channelId}/token`, { method: 'POST' });
+    if (res.status === 404) return null; // the request is gone: stop
+    if (!res.ok) throw new Error(`Token route failed: ${res.status}`); // retried with backoff
+    return res.json();
+  },
+});
+```
+
+ModelRiver only checks that the channel belongs to your project, not which of your users started it. Your route must check that the signed-in user owns the `channel_id` **before** it asks ModelRiver for a token. Save the `channel_id` with the user when you start the request:
+
+```javascript
+// Express example
+app.post('/api/ai/requests/:channelId/token', requireUser, async (req, res) => {
+  const { channelId } = req.params;
+
+  // 1. Only the user who started this request may listen to it
+  const owned = await db.aiRequests.findOne({ channelId, userId: req.user.id });
+  if (!owned) return res.status(404).end();
+
+  // 2. Ask ModelRiver for a new single-use token (API key stays on the server)
+  const mr = await fetch('https://api.modelriver.com/v1/ai/reconnect', {
+    method: 'POST',
+    headers: {
+      Authorization: `Bearer ${process.env.MODELRIVER_API_KEY}`,
+      'Content-Type': 'application/json',
+    },
+    body: JSON.stringify({ channel_id: channelId }),
+  });
+  if (mr.status === 404) return res.status(404).end(); // finished long ago, or never existed
+  if (!mr.ok) return res.status(502).end();
+
+  // { channel_id, project_id, ws_token, websocket_url, websocket_channel }
+  res.json(await mr.json());
+});
+```
+
+With `getToken` set, a stored request stays resumable for up to an hour after the page last saved it; without it, only as long as its stored token lives (5 minutes).
+
 ## How It Works
 
 1. **Your backend** calls ModelRiver's `/api/v1/ai/async` endpoint
@@ -560,8 +641,8 @@ Failed AI requests and test-mode runs aren't announced. Connections close after 
 3. **Your backend** returns these fields to the frontend (never the API key)
 4. **Your frontend** uses this SDK to connect via WebSocket using `channel_id` + `ws_token`
 5. **AI responses** are delivered in real-time to your frontend
-6. **The SDK** handles heartbeats, channel joins, and automatic reconnection for transient network issues.  
-7. For **page refresh recovery**, use the persistence + reconnect helpers (`persist`, `hasPendingRequest`, `reconnect`, `reconnectWithBackend`) together with your backend `/api/v1/ai/reconnect` endpoint.
+6. **The SDK** handles heartbeats and channel joins, and reconnects with single-use resume tokens after network drops, the 1-hour cutoff and page reloads within about 5 minutes.
+7. For **longer gaps** and ModelRiver restarts, pass `getToken`: your backend checks the user owns the request, then calls ModelRiver's `/v1/ai/reconnect` (see [Reconnecting](#reconnecting)).
 
 ```
 ┌──────────────┐       ┌──────────────┐       ┌──────────────┐
@@ -611,15 +692,17 @@ The `ws_token` is:
 - Short-lived (≈5 minutes)
 - Single-use (consumed on first successful WebSocket authentication)
 
-For page refresh recovery:
+Resume tokens are the same kind of credential:
 
-- The SDK persists the active request (by default) to `localStorage`
-- On reload, you can:
-  - either call `client.reconnect()` to reuse the stored `ws_token` (if still valid)
-  - or call `client.reconnectWithBackend()` to have your backend issue a **fresh** `ws_token` via `/api/v1/ai/reconnect`
+- Single-use, and they expire 5 minutes after they're issued
+- Scoped to one request: they can only join that request's channel, can't start requests and can't reach other channels
+- One at a time per connection: each refresh revokes the previous token, and the final response revokes the last one
+- Only issued to sockets that connected with a listening token
+
+For page refresh recovery, the SDK keeps the request's `channel_id` and its latest unused resume token in `localStorage` (by default). On reload, `client.reconnect()` resumes with that token, or asks `getToken` when it's stale or refused.
 
 **Important**: Always obtain `channel_id` and `ws_token` from your backend.  
-Never expose your ModelRiver API key in frontend code. Your backend should be the only component that talks to ModelRiver's HTTP API (`/api/v1/ai/async`, `/api/v1/ai/reconnect`, etc.).
+Never expose your ModelRiver API key in frontend code. Your backend should be the only component that talks to ModelRiver's HTTP API (`/v1/ai/async`, `/v1/ai/reconnect`, etc.), and your `getToken` route must check that the signed-in user owns the `channel_id` before calling `/v1/ai/reconnect`.
 
 ## Browser Support
 
@@ -629,6 +712,23 @@ Never expose your ModelRiver API key in frontend code. Your backend should be th
 - Edge 79+
 
 ## Changelog
+
+### 1.8.0
+
+- Async requests reconnect on their own. After joining, ModelRiver sends a single-use resume token, which the client rotates every 2 minutes (`tokenRefreshInterval`) and keeps in `localStorage`. After a network drop, ModelRiver's 1-hour cutoff or a page reload within about 5 minutes, the client reconnects with it, with backoff (`retryDelaysMs`)
+- Added the `getToken` option: a callback to your backend for a new token when the resume token is stale or refused (longer gaps, ModelRiver restarts). It returns ModelRiver's `/v1/ai/reconnect` JSON, or `null` when the request is gone
+- `reconnect()` now resumes with the stored resume token instead of the spent `ws_token`, and falls back to `getToken` on its own
+- Added the `reconnecting` connection state and event (`attempt`, `delayMs`). Dropped connections no longer emit `error` while the client is still retrying; it stops with one clear `error` when it has no way to get a token, instead of retrying a spent token forever
+- A reconnect keeps the request's steps, response and streamed text; only `connect()` starts from scratch
+- The socket now closes after the final response, so Phoenix can't retry it with a spent token
+- A dropped socket can no longer reconnect on its own with its spent token (also fixed for `subscribeToSession`)
+- Deprecated `apiBaseUrl` and `reconnectWithBackend()` in favour of `getToken`. `apiBaseUrl` still works as a fallback token source
+- Added `detach()`: closes the socket and stops all timers while keeping the stored request and resume token
+- The React, Vue and Angular adapters now `detach()` on unmount while a request is pending, instead of leaving the client running; Svelte's `disconnect()` still ends the request. All four start the mount-time `reconnect()` a tick later, so React StrictMode's double mount spends the stored token only once
+- Fixed the adapters clearing the stored request under the wrong key (`modelriver` instead of the default `modelriver_` prefix) and only when `persist: true` was passed explicitly
+- A resume token is not reused in the last 30 seconds before it expires
+- Exported the `ReconnectInfo` and `ReconnectRequest` types
+- Build: `deepmerge` (a dev dependency of the Rollup resolver) is pinned to 4.1.2 through `overrides`, because advisory GHSA-gcqx-w48m-w2h4 has no patched release. Remove the override once a fixed `deepmerge` ships
 
 ### 1.7.0
 

@@ -39,7 +39,7 @@
 
 import { writable, derived, type Readable } from 'svelte/store';
 import { ModelRiverClient } from './client';
-import { clearActiveRequest } from './utils';
+import { clearStoredRequest } from './utils';
 import type {
   ModelRiverClientOptions,
   ConnectOptions,
@@ -78,6 +78,8 @@ export function createModelRiver(
   // Create client
   const client = new ModelRiverClient(options);
   const unsubscribers: (() => void)[] = [];
+  // Init-time reconnect runs a tick later and is cancelled by disconnect()
+  let reconnectTimer: ReturnType<typeof setTimeout> | null = null;
 
   // Set up event listeners
   unsubscribers.push(
@@ -99,6 +101,12 @@ export function createModelRiver(
   );
 
   unsubscribers.push(
+    client.on('reconnecting', () => {
+      connectionStateStore.set('reconnecting');
+    })
+  );
+
+  unsubscribers.push(
     client.on('response', (data) => {
       responseStore.set(data);
       // Check for both 'completed' and 'success' statuses (both indicate workflow completion)
@@ -109,9 +117,7 @@ export function createModelRiver(
       if (isCompleted) {
         hasPendingRequestStore.set(false);
         // Clear from localStorage if persist is enabled
-        if (options.persist) {
-          clearActiveRequest(options.storageKeyPrefix || 'modelriver');
-        }
+        clearStoredRequest(options);
         // Disconnect immediately to prevent any further connection attempts
         if (client) {
           client.disconnect();
@@ -143,25 +149,22 @@ export function createModelRiver(
   if (currentState.isCompleted) {
     // Workflow is already completed, clear any pending request
     hasPendingRequestStore.set(false);
-    if (options.persist) {
-      clearActiveRequest(options.storageKeyPrefix || 'modelriver');
-    }
+    clearStoredRequest(options);
   } else if (client && client.hasPendingRequest()) {
     // Check if response status indicates completion (both 'completed' and 'success')
     const responseStatus = currentState.response?.status || currentState.response?.meta?.status;
     if (responseStatus === 'completed' || responseStatus === 'success' || responseStatus === 'SUCCESS') {
       // Response is already completed, clear the pending request
       hasPendingRequestStore.set(false);
-      if (options.persist) {
-        clearActiveRequest(options.storageKeyPrefix || 'modelriver');
-      }
+      clearStoredRequest(options);
     } else {
       // Not completed, safe to attempt reconnection
       hasPendingRequestStore.set(true);
-      // Attempt reconnection
-      if (client) {
-        client.reconnect();
-      }
+      // Attempt reconnection (false when the stored request can't be resumed)
+      reconnectTimer = setTimeout(() => {
+        reconnectTimer = null;
+        if (!client.reconnect()) hasPendingRequestStore.set(false);
+      }, 0);
     }
   }
 
@@ -177,6 +180,8 @@ export function createModelRiver(
 
   // Disconnect method
   const disconnect = (): void => {
+    if (reconnectTimer) clearTimeout(reconnectTimer);
+    reconnectTimer = null;
     client.disconnect();
     hasPendingRequestStore.set(false);
 
@@ -184,11 +189,8 @@ export function createModelRiver(
     unsubscribers.forEach((unsub) => unsub());
     unsubscribers.length = 0;
 
-    // Only destroy if no pending request and workflow is not already completed
-    const state = client.getState();
-    if (!client.hasPendingRequest() && !state.isCompleted) {
-      client.destroy();
-    }
+    // disconnect() ended the request (and cleared it from storage): release everything
+    client.destroy();
   };
 
   // Reset method

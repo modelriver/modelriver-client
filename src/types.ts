@@ -15,17 +15,43 @@ export interface ModelRiverClientOptions {
   baseUrl?: string;
 
   /**
-   * Optional HTTP API base URL for reconnection.
+   * Optional HTTP base URL of your own backend for reconnection.
    *
-   * When provided, the client can call your backend's
-   * `/api/v1/ai/reconnect` endpoint to obtain a fresh
-   * `ws_token` for an existing async request after a
-   * page refresh, instead of reusing a stale token
-   * from localStorage.
+   * The client POSTs `{ channel_id }` to `${apiBaseUrl}/api/v1/ai/reconnect`
+   * (on your backend, without credentials) and expects ModelRiver's
+   * `/api/v1/ai/reconnect` JSON back.
    *
-   * Example: 'https://your-app.com'
+   * @deprecated Use `getToken`, which lets you choose the route, send your
+   * own auth and check that the signed-in user owns the request.
    */
   apiBaseUrl?: string;
+
+  /**
+   * Fetches a new listening token from your backend when the client can't
+   * reconnect with the resume token it already holds (gaps longer than about
+   * 5 minutes, or ModelRiver restarting). Your backend checks that the
+   * signed-in user owns `channelId`, then calls ModelRiver's
+   * `POST /api/v1/ai/reconnect` with its API key and returns the JSON as is
+   * (snake_case or camelCase).
+   *
+   * Return `null` when the request no longer exists (ModelRiver answered 404):
+   * the client stops with an error. Throwing makes the client wait and retry.
+   */
+  getToken?: (request: ReconnectRequest) => Promise<ReconnectInfo | null>;
+
+  /**
+   * Waits between reconnection attempts in ms; the last one repeats.
+   * @default [1000, 2000, 5000, 10000, 30000]
+   */
+  retryDelaysMs?: number[];
+
+  /**
+   * How often a connected client asks ModelRiver for a fresh resume token,
+   * in ms. Resume tokens expire 5 minutes after they're issued, so keep this
+   * well under that. Set to 0 to turn refreshing off.
+   * @default 120000 (2 minutes)
+   */
+  tokenRefreshInterval?: number;
 
   /**
    * Enable debug logging
@@ -56,6 +82,33 @@ export interface ModelRiverClientOptions {
    * @default 300000 (5 minutes)
    */
   requestTimeout?: number;
+}
+
+/**
+ * What the client passes to `getToken`
+ */
+export interface ReconnectRequest {
+  /** Channel ID of the async request to resume */
+  channelId: string;
+  /** Channel topic the client was following, if known */
+  websocketChannel?: string;
+}
+
+/**
+ * What `getToken` returns: the JSON from ModelRiver's
+ * `POST /api/v1/ai/reconnect`, passed through as is. camelCase keys work too.
+ */
+export interface ReconnectInfo {
+  channel_id?: string;
+  project_id?: string;
+  ws_token?: string;
+  websocket_url?: string;
+  websocket_channel?: string;
+  channelId?: string;
+  projectId?: string;
+  wsToken?: string;
+  websocketUrl?: string;
+  websocketChannel?: string;
 }
 
 /**
@@ -217,7 +270,7 @@ export interface AIResponse {
 /**
  * Connection state
  */
-export type ConnectionState = 'disconnected' | 'connecting' | 'connected' | 'error';
+export type ConnectionState = 'disconnected' | 'connecting' | 'connected' | 'reconnecting' | 'error';
 
 /**
  * Active request stored in localStorage for persistence
@@ -225,7 +278,10 @@ export type ConnectionState = 'disconnected' | 'connecting' | 'connected' | 'err
 export interface ActiveRequest {
   /** Channel ID */
   channelId: string;
-  /** One-time WebSocket token */
+  /**
+   * Single-use listening token for the next connection: the latest resume
+   * token, or an empty string once it has been used
+   */
   wsToken: string;
   /** Timestamp when request was created */
   timestamp: number;
@@ -290,6 +346,7 @@ export type ModelRiverEventType =
   | 'error'
   | 'step'
   | 'connecting'
+  | 'reconnecting'
   | 'channel_joined'
   | 'channel_error'
   | 'stream_start'
@@ -307,6 +364,8 @@ export interface ModelRiverEventMap {
   error: (error: Error | string) => void;
   step: (step: WorkflowStep) => void;
   connecting: () => void;
+  /** The connection dropped; the next attempt starts after `delayMs` */
+  reconnecting: (attempt: number, delayMs: number) => void;
   channel_joined: () => void;
   channel_error: (reason: string) => void;
   stream_start: (data: StreamStartPayload) => void;

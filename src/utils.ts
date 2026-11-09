@@ -31,6 +31,65 @@ export const DEFAULT_REQUEST_TIMEOUT = 300000;
  */
 export const ACTIVE_REQUEST_KEY = 'active_request';
 
+/** Waits between reconnection attempts; the last one repeats. */
+export const DEFAULT_SESSION_RETRY_DELAYS_MS = [1_000, 2_000, 5_000, 10_000, 30_000];
+
+/**
+ * Listening tokens (the first `ws_token` and every resume token) expire on the
+ * server 5 minutes after they are issued.
+ */
+export const LISTENING_TOKEN_TTL_MS = 300000;
+
+/**
+ * How long the client treats a listening token as usable: 30 seconds short of
+ * its expiry, to absorb clock and network delays.
+ */
+export const LISTENING_TOKEN_USABLE_MS = 270000;
+
+/** How often a connected client asks for a fresh resume token (2 minutes). */
+export const DEFAULT_TOKEN_REFRESH_INTERVAL = 120000;
+
+/**
+ * How long a stored request stays resumable when the client can fetch a new
+ * token (`getToken` or `apiBaseUrl`). Without one, the stored token's own
+ * 5-minute life is the limit.
+ */
+export const RESUMABLE_REQUEST_MAX_AGE_MS = 3600000;
+
+/**
+ * Close a Phoenix socket for good. `disconnect()` cancels Phoenix's pending
+ * reconnect, but a teardown already in flight (after a heartbeat timeout, say)
+ * can schedule another one afterwards, which would resend the socket's spent
+ * single-use token forever. Disabling `connect()` stops that too.
+ */
+export function retireSocket(socket: { disconnect: () => void; connect: (...args: any[]) => void }): void {
+  socket.connect = () => {};
+  socket.disconnect();
+}
+
+/** Connection details as ModelRiver returns them: snake_case or camelCase. */
+export interface ConnectionInfoLike {
+  ws_token?: string;
+  wsToken?: string;
+  websocket_url?: string;
+  websocketUrl?: string;
+  websocket_channel?: string;
+  websocketChannel?: string;
+}
+
+/**
+ * Normalise connection details (snake_case or camelCase) into a socket URL,
+ * token and channel topic.
+ */
+export function readInfo(info: ConnectionInfoLike, fallbackUrl: string = DEFAULT_BASE_URL) {
+  const url = info.websocketUrl ?? info.websocket_url ?? fallbackUrl;
+  return {
+    socketUrl: url.endsWith('/socket') ? url : `${url}/socket`,
+    token: info.wsToken ?? info.ws_token,
+    topic: info.websocketChannel ?? info.websocket_channel,
+  };
+}
+
 /**
  * Decode a base64url string to a regular string
  */
@@ -157,9 +216,12 @@ export function saveActiveRequest(
 
 /**
  * Get active request from localStorage
- * Returns null if not found or expired (older than 5 minutes)
+ * Returns null if not found or older than `maxAgeMs` (default 5 minutes)
  */
-export function getActiveRequest(prefix: string): ActiveRequest | null {
+export function getActiveRequest(
+  prefix: string,
+  maxAgeMs: number = DEFAULT_REQUEST_TIMEOUT
+): ActiveRequest | null {
   if (!isStorageAvailable()) return null;
 
   try {
@@ -168,9 +230,9 @@ export function getActiveRequest(prefix: string): ActiveRequest | null {
 
     const request = JSON.parse(stored) as ActiveRequest;
 
-    // Check if request is less than 5 minutes old
+    // Drop requests older than maxAgeMs
     const age = Date.now() - request.timestamp;
-    if (age > DEFAULT_REQUEST_TIMEOUT) {
+    if (age > maxAgeMs) {
       clearActiveRequest(prefix);
       return null;
     }
@@ -192,6 +254,15 @@ export function clearActiveRequest(prefix: string): void {
   } catch {
     // Ignore errors
   }
+}
+
+/**
+ * Clear the stored request for a client configured with these options
+ * (used by the framework adapters; persistence is on unless `persist: false`)
+ */
+export function clearStoredRequest(options: { persist?: boolean; storageKeyPrefix?: string }): void {
+  if (options.persist === false) return;
+  clearActiveRequest(options.storageKeyPrefix || DEFAULT_STORAGE_KEY_PREFIX);
 }
 
 /**

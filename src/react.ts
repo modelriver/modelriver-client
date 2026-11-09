@@ -31,7 +31,7 @@
 
 import { useState, useEffect, useCallback, useRef } from 'react';
 import { ModelRiverClient } from './client';
-import { clearActiveRequest } from './utils';
+import { clearStoredRequest } from './utils';
 import type {
   ModelRiverClientOptions,
   ConnectOptions,
@@ -84,6 +84,11 @@ export function useModelRiver(
       setConnectionState('disconnected');
     });
 
+    // The connection dropped and the client is getting it back on its own
+    const unsubReconnecting = client.on('reconnecting', () => {
+      setConnectionState('reconnecting');
+    });
+
     const unsubResponse = client.on('response', (data) => {
       setResponse(data);
       // Check for both 'completed' and 'success' statuses (both indicate workflow completion)
@@ -94,9 +99,7 @@ export function useModelRiver(
       if (isCompleted) {
         setHasPendingRequest(false);
         // Clear from localStorage if persist is enabled
-        if (optionsRef.current.persist) {
-          clearActiveRequest(optionsRef.current.storageKeyPrefix || 'modelriver');
-        }
+        clearStoredRequest(optionsRef.current);
         // Disconnect immediately to prevent any further connection attempts
         if (client) {
           client.disconnect();
@@ -118,31 +121,32 @@ export function useModelRiver(
       setSteps([...state.steps]);
     });
 
+    // Mount-time reconnect runs a tick later and is cancelled on unmount, so
+    // StrictMode's mount -> unmount -> mount never spends the stored token twice
+    let reconnectTimer: ReturnType<typeof setTimeout> | null = null;
+
     // Check for pending request on mount
     // First check if workflow is already completed - if so, skip all reconnection logic
     const currentState = client.getState();
     if (currentState.isCompleted) {
       // Workflow is already completed, clear any pending request
       setHasPendingRequest(false);
-      if (optionsRef.current.persist) {
-        clearActiveRequest(optionsRef.current.storageKeyPrefix || 'modelriver');
-      }
+      clearStoredRequest(optionsRef.current);
     } else if (client && client.hasPendingRequest()) {
       // Check if response status indicates completion (both 'completed' and 'success')
       const responseStatus = currentState.response?.status || currentState.response?.meta?.status;
       if (responseStatus === 'completed' || responseStatus === 'success' || responseStatus === 'SUCCESS') {
         // Response is already completed, clear the pending request
         setHasPendingRequest(false);
-        if (optionsRef.current.persist) {
-          clearActiveRequest(optionsRef.current.storageKeyPrefix || 'modelriver');
-        }
+        clearStoredRequest(optionsRef.current);
       } else {
         // Not completed, safe to attempt reconnection
         setHasPendingRequest(true);
-        // Attempt reconnection
-        if (client) {
-          client.reconnect();
-        }
+        // Attempt reconnection (false when the stored request can't be resumed)
+        reconnectTimer = setTimeout(() => {
+          reconnectTimer = null;
+          if (!client.reconnect()) setHasPendingRequest(false);
+        }, 0);
       }
     }
 
@@ -151,16 +155,21 @@ export function useModelRiver(
       unsubConnecting();
       unsubConnected();
       unsubDisconnected();
+      unsubReconnecting();
       unsubResponse();
       unsubError();
       unsubStep();
 
-      // Only destroy if there's no pending request and workflow is not already completed
-      // If workflow is completed, the connection is already closed and cleaned up
-      const state = client.getState();
-      if (!client.hasPendingRequest() && !state.isCompleted) {
+      if (reconnectTimer) clearTimeout(reconnectTimer);
+
+      // A pending request stays stored (with its resume token) for the next
+      // mount or page load; otherwise release everything
+      if (client.hasPendingRequest()) {
+        client.detach();
+      } else {
         client.destroy();
       }
+      clientRef.current = null;
     };
   }, []); // Only run on mount/unmount
 
