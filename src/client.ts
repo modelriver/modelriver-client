@@ -20,6 +20,12 @@ import type {
   StreamDeltaPayload,
   StreamDonePayload,
   StreamErrorPayload,
+  ToolCall,
+  ToolRound,
+  ToolRoundStartedPayload,
+  ToolCallStartedPayload,
+  ToolCallCompletedPayload,
+  ToolStatePayload,
 } from './types';
 import {
   DEFAULT_BASE_URL,
@@ -132,6 +138,10 @@ export class ModelRiverClient {
   private isConnecting = false;
   private isCompleted = false; // Flag to track if workflow is completed, preventing reconnection
   private streamText = ''; // Text accumulated from stream_delta events
+  /** Hosted tools: the request's tool calls, in the order they started */
+  private toolCalls: ToolCall[] = [];
+  /** Hosted tools: the model round the request is on */
+  private toolRound: ToolRound | null = null;
   private logger: ReturnType<typeof createLogger>;
 
   // Reconnection state
@@ -198,6 +208,8 @@ export class ModelRiverClient {
       hasPendingRequest: this.hasPendingRequest(),
       isCompleted: this.isCompleted,
       streamText: this.streamText,
+      toolCalls: this.toolCalls.map((call) => ({ ...call })),
+      toolRound: this.toolRound ? { ...this.toolRound } : null,
     };
   }
 
@@ -250,6 +262,7 @@ export class ModelRiverClient {
     this.response = null;
     this.isCompleted = false; // Reset completed flag for new connection
     this.streamText = '';
+    this.clearToolCalls();
     this.startRequest({ channelId, websocketUrl, websocketChannel });
 
     // Save to localStorage for persistence
@@ -449,6 +462,126 @@ export class ModelRiverClient {
       if (mine !== this.generation) return;
       this.logger.error('Stream error:', payload?.message);
       this.emit('stream_error', payload);
+    });
+
+    // Hosted tools: progress while ModelRiver runs the workflow's tools. No
+    // arguments or results are sent, and the final `response` still follows.
+    channel.on('tool_round_started', (payload: ToolRoundStartedPayload) => {
+      if (mine !== this.generation || !payload) return;
+      this.toolRound = { round: payload.round, max_rounds: payload.max_rounds };
+      this.emit('tool_round_started', payload);
+      this.emitToolCalls();
+    });
+
+    channel.on('tool_call_started', (payload: ToolCallStartedPayload) => {
+      if (mine !== this.generation || !payload?.id) return;
+      this.upsertToolCall({
+        id: payload.id,
+        name: payload.name,
+        label: payload.label ?? null,
+        round: payload.round,
+        status: 'running',
+      });
+      this.emit('tool_call_started', payload);
+      this.emitToolCalls();
+    });
+
+    channel.on('tool_call_completed', (payload: ToolCallCompletedPayload) => {
+      if (mine !== this.generation || !payload?.id) return;
+      this.upsertToolCall({
+        id: payload.id,
+        name: payload.name,
+        round: payload.round,
+        status: payload.status,
+        duration_ms: payload.duration_ms,
+        user_message: payload.user_message ?? null,
+      });
+      this.emit('tool_call_completed', payload);
+      this.emitToolCalls();
+    });
+
+    // Sent on join when the request is already under way: it replaces what
+    // the client had, which may be missing events from while it was away
+    channel.on('tool_state', (payload: ToolStatePayload) => {
+      if (mine !== this.generation || !payload) return;
+      this.toolRound = { round: payload.round, max_rounds: payload.max_rounds };
+      this.toolCalls = Array.isArray(payload.calls) ? payload.calls.map((call) => ({ ...call })) : [];
+      this.emit('tool_state', payload);
+      this.emitToolCalls();
+    });
+  }
+
+  /**
+   * Add a tool call, or update the one with the same id (a completion for a
+   * call whose start this client missed is added)
+   */
+  private upsertToolCall(call: ToolCall): void {
+    const index = this.toolCalls.findIndex((existing) => existing.id === call.id);
+    if (index === -1) {
+      this.toolCalls = [...this.toolCalls, call];
+    } else {
+      // Keep what the start told us (the label) when the completion omits it
+      const merged: ToolCall = { ...this.toolCalls[index]!, ...call };
+      if (call.label === undefined) merged.label = this.toolCalls[index]!.label;
+      this.toolCalls = this.toolCalls.map((existing, i) => (i === index ? merged : existing));
+    }
+  }
+
+  private emitToolCalls(): void {
+    this.emit(
+      'tool_calls',
+      this.toolCalls.map((call) => ({ ...call })),
+      this.toolRound ? { ...this.toolRound } : null
+    );
+  }
+
+  private clearToolCalls(): void {
+    const had = this.toolCalls.length > 0 || this.toolRound !== null;
+    this.toolCalls = [];
+    this.toolRound = null;
+    if (had) this.emitToolCalls();
+  }
+
+  /**
+   * The request ended. A call still shown as running finished without this
+   * client seeing it (events missed while reconnecting), so stop its spinner.
+   */
+  private settleToolCalls(): void {
+    if (!this.toolCalls.some((call) => call.status === 'running')) return;
+    this.toolCalls = this.toolCalls.map((call) =>
+      call.status === 'running' ? { ...call, status: 'ended' } : call
+    );
+    this.emitToolCalls();
+  }
+
+  /**
+   * Hosted tools: ask ModelRiver to stop the request this client is following.
+   *
+   * ModelRiver starts no further model round; a tool call already under way is
+   * left to finish. The final `response` then arrives as usual, with status
+   * "error" and `error.type` "cancelled", so keep listening for it. Rounds
+   * that already ran are still counted.
+   *
+   * Resolves true when the server took the request to stop, and false when
+   * the client isn't joined to a request or the server doesn't support it.
+   */
+  cancel(): Promise<boolean> {
+    const channel = this.channel;
+    if (!channel || this.stopped || this.unjoinedSince !== null) {
+      this.logger.warn('cancel() needs a joined request');
+      return Promise.resolve(false);
+    }
+
+    return new Promise<boolean>((resolve) => {
+      channel
+        .push('cancel', {})
+        .receive('ok', () => resolve(true))
+        .receive('error', (reply?: { reason?: string }) => {
+          // "unhandled_event": a server without hosted tools
+          this.logger.log('Cancel was not accepted:', reply?.reason ?? 'unknown');
+          resolve(false);
+        })
+        .receive('timeout', () => resolve(false));
     });
   }
 
@@ -824,6 +957,7 @@ export class ModelRiverClient {
       this.updateStepAndEmit('receive', { status: 'success', duration: 50 });
       this.updateStepAndEmit('complete', { status: 'success' });
       this.response = payload;
+      this.settleToolCalls();
 
       // Mark workflow as completed to prevent reconnection attempts
       this.isCompleted = true;
@@ -876,6 +1010,7 @@ export class ModelRiverClient {
     }
 
     // A final response (success or error): the server revoked the resume token
+    this.settleToolCalls();
     this.finishRequest();
 
     // Clear active request from localStorage
@@ -956,6 +1091,7 @@ export class ModelRiverClient {
     this.steps = [];
     this.response = null;
     this.error = null;
+    this.clearToolCalls();
     this.currentWebsocketChannel = null;
     this.request = null;
     this.usedTokens.clear();

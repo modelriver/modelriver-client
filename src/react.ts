@@ -38,6 +38,8 @@ import type {
   ConnectionState,
   WorkflowStep,
   AIResponse,
+  ToolCall,
+  ToolRound,
   UseModelRiverReturn,
 } from './types';
 
@@ -56,6 +58,9 @@ export function useModelRiver(
   const [response, setResponse] = useState<AIResponse | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [hasPendingRequest, setHasPendingRequest] = useState(false);
+  const [streamText, setStreamText] = useState('');
+  const [toolCalls, setToolCalls] = useState<ToolCall[]>([]);
+  const [toolRound, setToolRound] = useState<ToolRound | null>(null);
 
   // Refs
   const clientRef = useRef<ModelRiverClient | null>(null);
@@ -121,6 +126,19 @@ export function useModelRiver(
       setSteps([...state.steps]);
     });
 
+    // Token streaming (`stream: true` requests)
+    const unsubStreamStart = client.on('stream_start', () => setStreamText(''));
+    const unsubStreamDelta = client.on('stream_delta', (_delta, text) => setStreamText(text));
+    const unsubStreamDone = client.on('stream_done', (data) => {
+      if (typeof data?.accumulated_text === 'string') setStreamText(data.accumulated_text);
+    });
+
+    // Hosted tools: the request's tool calls and the round it is on
+    const unsubToolCalls = client.on('tool_calls', (calls, round) => {
+      setToolCalls(calls);
+      setToolRound(round);
+    });
+
     // Mount-time reconnect runs a tick later and is cancelled on unmount, so
     // StrictMode's mount -> unmount -> mount never spends the stored token twice
     let reconnectTimer: ReturnType<typeof setTimeout> | null = null;
@@ -159,6 +177,10 @@ export function useModelRiver(
       unsubResponse();
       unsubError();
       unsubStep();
+      unsubStreamStart();
+      unsubStreamDelta();
+      unsubStreamDone();
+      unsubToolCalls();
 
       if (reconnectTimer) clearTimeout(reconnectTimer);
 
@@ -180,6 +202,9 @@ export function useModelRiver(
     setError(null);
     setResponse(null);
     setSteps([]);
+    setStreamText('');
+    setToolCalls([]);
+    setToolRound(null);
     setHasPendingRequest(true);
 
     clientRef.current.connect(connectOptions);
@@ -202,7 +227,16 @@ export function useModelRiver(
     setSteps([]);
     setResponse(null);
     setError(null);
+    setStreamText('');
+    setToolCalls([]);
+    setToolRound(null);
     setHasPendingRequest(false);
+  }, []);
+
+  // Hosted tools: ask ModelRiver to stop the request (the final response still arrives)
+  const cancel = useCallback((): Promise<boolean> => {
+    if (!clientRef.current) return Promise.resolve(false);
+    return clientRef.current.cancel();
   }, []);
 
   return {
@@ -213,9 +247,13 @@ export function useModelRiver(
     response,
     error,
     hasPendingRequest,
+    streamText,
+    toolCalls,
+    toolRound,
     connect,
     disconnect,
     reset,
+    cancel,
   };
 }
 

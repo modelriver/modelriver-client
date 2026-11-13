@@ -38,6 +38,8 @@ import type {
   ConnectionState,
   WorkflowStep,
   AIResponse,
+  ToolCall,
+  ToolRound,
   UseModelRiverVueReturn,
 } from './types';
 
@@ -56,6 +58,8 @@ export function useModelRiver(
   const response = ref<AIResponse | null>(null);
   const error = ref<string | null>(null);
   const hasPendingRequest = ref(false);
+  const toolCalls = ref<ToolCall[]>([]);
+  const toolRound = ref<ToolRound | null>(null);
   const isConnected = ref(false);
   const isConnecting = ref(false);
 
@@ -142,6 +146,14 @@ export function useModelRiver(
       })
     );
 
+    // Hosted tools: the request's tool calls and the round it is on
+    unsubscribers.push(
+      client.on('tool_calls', (calls, round) => {
+        toolCalls.value = calls;
+        toolRound.value = round;
+      })
+    );
+
     // Check for pending request on mount
     // First check if workflow is already completed - if so, skip all reconnection logic
     const currentState = client.getState();
@@ -195,6 +207,8 @@ export function useModelRiver(
     error.value = null;
     response.value = null;
     steps.value = [];
+    toolCalls.value = [];
+    toolRound.value = null;
     hasPendingRequest.value = true;
 
     client.connect(connectOptions);
@@ -219,7 +233,15 @@ export function useModelRiver(
     steps.value = [];
     response.value = null;
     error.value = null;
+    toolCalls.value = [];
+    toolRound.value = null;
     hasPendingRequest.value = false;
+  };
+
+  // Hosted tools: ask ModelRiver to stop the request (the final response still arrives)
+  const cancel = (): Promise<boolean> => {
+    if (!client) return Promise.resolve(false);
+    return client.cancel();
   };
 
   // Lifecycle hooks
@@ -239,9 +261,12 @@ export function useModelRiver(
     response,
     error,
     hasPendingRequest,
+    toolCalls,
+    toolRound,
     connect,
     disconnect,
     reset,
+    cancel,
   };
 }
 

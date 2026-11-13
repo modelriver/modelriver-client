@@ -46,6 +46,8 @@ import type {
   ConnectionState,
   WorkflowStep,
   AIResponse,
+  ToolCall,
+  ToolRound,
   ModelRiverSvelteStore,
 } from './types';
 
@@ -64,6 +66,8 @@ export function createModelRiver(
   const responseStore = writable<AIResponse | null>(null);
   const errorStore = writable<string | null>(null);
   const hasPendingRequestStore = writable<boolean>(false);
+  const toolCallsStore = writable<ToolCall[]>([]);
+  const toolRoundStore = writable<ToolRound | null>(null);
 
   // Derived stores for convenience
   const isConnectedStore = derived(
@@ -143,6 +147,14 @@ export function createModelRiver(
     })
   );
 
+  // Hosted tools: the request's tool calls and the round it is on
+  unsubscribers.push(
+    client.on('tool_calls', (calls, round) => {
+      toolCallsStore.set(calls);
+      toolRoundStore.set(round);
+    })
+  );
+
   // Check for pending request on init
   // First check if workflow is already completed - if so, skip all reconnection logic
   const currentState = client.getState();
@@ -173,6 +185,8 @@ export function createModelRiver(
     errorStore.set(null);
     responseStore.set(null);
     stepsStore.set([]);
+    toolCallsStore.set([]);
+    toolRoundStore.set(null);
     hasPendingRequestStore.set(true);
 
     client.connect(connectOptions);
@@ -200,8 +214,13 @@ export function createModelRiver(
     stepsStore.set([]);
     responseStore.set(null);
     errorStore.set(null);
+    toolCallsStore.set([]);
+    toolRoundStore.set(null);
     hasPendingRequestStore.set(false);
   };
+
+  // Hosted tools: ask ModelRiver to stop the request (the final response still arrives)
+  const cancel = (): Promise<boolean> => client.cancel();
 
   return {
     connectionState: { subscribe: connectionStateStore.subscribe } as Readable<ConnectionState>,
@@ -211,9 +230,12 @@ export function createModelRiver(
     response: { subscribe: responseStore.subscribe } as Readable<AIResponse | null>,
     error: { subscribe: errorStore.subscribe } as Readable<string | null>,
     hasPendingRequest: { subscribe: hasPendingRequestStore.subscribe } as Readable<boolean>,
+    toolCalls: { subscribe: toolCallsStore.subscribe } as Readable<ToolCall[]>,
+    toolRound: { subscribe: toolRoundStore.subscribe } as Readable<ToolRound | null>,
     connect,
     disconnect,
     reset,
+    cancel,
   };
 }
 

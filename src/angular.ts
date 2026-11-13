@@ -43,6 +43,8 @@ import type {
   ConnectionState,
   WorkflowStep,
   AIResponse,
+  ToolCall,
+  ToolRound,
 } from './types';
 
 /**
@@ -62,6 +64,8 @@ export class ModelRiverService {
   private responseSubject = new BehaviorSubject<AIResponse | null>(null);
   private errorSubject = new BehaviorSubject<string | null>(null);
   private hasPendingRequestSubject = new BehaviorSubject<boolean>(false);
+  private toolCallsSubject = new BehaviorSubject<ToolCall[]>([]);
+  private toolRoundSubject = new BehaviorSubject<ToolRound | null>(null);
 
   // Public observables
   readonly connectionState$: Observable<ConnectionState> = this.connectionStateSubject.asObservable();
@@ -69,6 +73,10 @@ export class ModelRiverService {
   readonly response$: Observable<AIResponse | null> = this.responseSubject.asObservable();
   readonly error$: Observable<string | null> = this.errorSubject.asObservable();
   readonly hasPendingRequest$: Observable<boolean> = this.hasPendingRequestSubject.asObservable();
+  /** Hosted tools: the current request's tool calls, in the order they started */
+  readonly toolCalls$: Observable<ToolCall[]> = this.toolCallsSubject.asObservable();
+  /** Hosted tools: the model round the current request is on */
+  readonly toolRound$: Observable<ToolRound | null> = this.toolRoundSubject.asObservable();
 
   // Convenience getters for current values
   get isConnected(): boolean {
@@ -154,6 +162,14 @@ export class ModelRiverService {
       })
     );
 
+    // Hosted tools: the request's tool calls and the round it is on
+    this.unsubscribers.push(
+      this.client.on('tool_calls', (calls, round) => {
+        this.toolCallsSubject.next(calls);
+        this.toolRoundSubject.next(round);
+      })
+    );
+
     // Check for pending request on init
     // First check if workflow is already completed - if so, skip all reconnection logic
     const currentState = this.client.getState();
@@ -195,6 +211,8 @@ export class ModelRiverService {
     this.errorSubject.next(null);
     this.responseSubject.next(null);
     this.stepsSubject.next([]);
+    this.toolCallsSubject.next([]);
+    this.toolRoundSubject.next(null);
     this.hasPendingRequestSubject.next(true);
 
     this.client.connect(options);
@@ -221,7 +239,18 @@ export class ModelRiverService {
     this.stepsSubject.next([]);
     this.responseSubject.next(null);
     this.errorSubject.next(null);
+    this.toolCallsSubject.next([]);
+    this.toolRoundSubject.next(null);
     this.hasPendingRequestSubject.next(false);
+  }
+
+  /**
+   * Hosted tools: ask ModelRiver to stop the request. The final response
+   * (an error of type "cancelled") still arrives afterwards.
+   */
+  cancel(): Promise<boolean> {
+    if (!this.client) return Promise.resolve(false);
+    return this.client.cancel();
   }
 
   /**
@@ -234,6 +263,8 @@ export class ModelRiverService {
     this.responseSubject.complete();
     this.errorSubject.complete();
     this.hasPendingRequestSubject.complete();
+    this.toolCallsSubject.complete();
+    this.toolRoundSubject.complete();
   }
 
   private cleanup(): void {

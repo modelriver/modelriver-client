@@ -210,13 +210,27 @@ export interface ResponseMeta {
   status?: string;
   duration_ms?: number;
   usage?: TokenUsage;
+  /**
+   * Hosted tools: how many model rounds and tool calls the request used.
+   * Each round counts as one request on your plan.
+   */
+  tool_loop?: {
+    rounds: number;
+    tool_calls: number;
+  };
 }
 
 /**
  * Error details in response
  */
 export interface ResponseError {
+  /** Safe to show to the end user */
   message: string;
+  /**
+   * What went wrong, when the server says: for example "cancelled",
+   * "tool_loop_limit" or "tool_loop_timeout" on a hosted-tools request
+   */
+  type?: string;
   details?: unknown;
 }
 
@@ -337,6 +351,75 @@ export interface StreamErrorPayload {
 }
 
 /**
+ * Where one tool call of a hosted-tools request stands.
+ *
+ * - `running`: ModelRiver is calling your endpoint
+ * - `ok`: the endpoint returned a result
+ * - `error`: the call failed (the model is told, and may still answer)
+ * - `timeout`: the endpoint did not answer in time
+ * - `ended`: the request finished before this client saw the call finish
+ *   (for example after a reconnect); set by the client, never by the server
+ */
+export type ToolCallStatus = 'running' | 'ok' | 'error' | 'timeout' | 'ended';
+
+/**
+ * One tool call, as shown to the end user. Arguments and results never reach
+ * the browser.
+ */
+export interface ToolCall {
+  /** Stable for the call, across retries and reconnects */
+  id: string;
+  /** The tool's name */
+  name: string;
+  /** The tool's progress label from the console ("Looking up your orders…"), if it has one */
+  label?: string | null;
+  /** The model round the call belongs to (1-based) */
+  round?: number;
+  status: ToolCallStatus;
+  /** Set once the call has finished */
+  duration_ms?: number;
+  /** A message your endpoint marked as safe to show the end user, if it sent one */
+  user_message?: string | null;
+}
+
+/**
+ * The model round a hosted-tools request is on
+ */
+export interface ToolRound {
+  round: number;
+  max_rounds: number;
+}
+
+/** Sent when a model round starts */
+export type ToolRoundStartedPayload = ToolRound;
+
+/** Sent when ModelRiver starts calling one of your tools */
+export interface ToolCallStartedPayload {
+  id: string;
+  name: string;
+  label?: string | null;
+  round: number;
+}
+
+/** Sent when a tool call has finished, whatever the outcome */
+export interface ToolCallCompletedPayload {
+  id: string;
+  name: string;
+  round: number;
+  status: 'ok' | 'error' | 'timeout';
+  duration_ms: number;
+  user_message?: string | null;
+}
+
+/**
+ * Sent once when the client joins (or rejoins) a hosted-tools request that is
+ * already under way: where the request stands
+ */
+export interface ToolStatePayload extends ToolRound {
+  calls: ToolCall[];
+}
+
+/**
  * Event types emitted by ModelRiverClient
  */
 export type ModelRiverEventType =
@@ -352,7 +435,12 @@ export type ModelRiverEventType =
   | 'stream_start'
   | 'stream_delta'
   | 'stream_done'
-  | 'stream_error';
+  | 'stream_error'
+  | 'tool_round_started'
+  | 'tool_call_started'
+  | 'tool_call_completed'
+  | 'tool_state'
+  | 'tool_calls';
 
 /**
  * Event listener callback types
@@ -373,6 +461,20 @@ export interface ModelRiverEventMap {
   stream_delta: (data: StreamDeltaPayload, text: string) => void;
   stream_done: (data: StreamDonePayload) => void;
   stream_error: (data: StreamErrorPayload) => void;
+  /** Hosted tools: a model round started */
+  tool_round_started: (data: ToolRoundStartedPayload) => void;
+  /** Hosted tools: ModelRiver started calling one of your tools */
+  tool_call_started: (data: ToolCallStartedPayload) => void;
+  /** Hosted tools: a tool call finished */
+  tool_call_completed: (data: ToolCallCompletedPayload) => void;
+  /** Hosted tools: where the request stands, sent when joining part-way */
+  tool_state: (data: ToolStatePayload) => void;
+  /**
+   * Hosted tools: the list of tool calls changed. Receives every call so far,
+   * in the order they started, and the current round. Listen to this one to
+   * draw progress; the four events above are the raw messages behind it.
+   */
+  tool_calls: (calls: ToolCall[], round: ToolRound | null) => void;
 }
 
 /**
@@ -397,18 +499,34 @@ export interface ModelRiverState {
   isCompleted?: boolean;
   /** Text streamed so far for the current request (`stream: true` requests only) */
   streamText?: string;
+  /** Hosted tools: every tool call of the current request, in the order they started */
+  toolCalls?: ToolCall[];
+  /** Hosted tools: the model round the current request is on */
+  toolRound?: ToolRound | null;
 }
 
 /**
  * Return type for React hook
  */
 export interface UseModelRiverReturn extends ModelRiverState {
+  /** Text streamed so far for the current request (`stream: true` requests only) */
+  streamText: string;
+  /** Hosted tools: every tool call of the current request, in the order they started */
+  toolCalls: ToolCall[];
+  /** Hosted tools: the model round the current request is on */
+  toolRound: ToolRound | null;
   /** Connect to WebSocket with token */
   connect: (options: ConnectOptions) => void;
   /** Disconnect from WebSocket */
   disconnect: () => void;
   /** Reset state and clear stored data */
   reset: () => void;
+  /**
+   * Hosted tools: ask ModelRiver to stop the request. Resolves true when the
+   * server took the request to stop; the final `response` (an error of type
+   * "cancelled") still arrives afterwards.
+   */
+  cancel: () => Promise<boolean>;
 }
 
 /**
@@ -429,12 +547,18 @@ export interface UseModelRiverVueReturn {
   error: import('vue').Ref<string | null>;
   /** Reactive pending request status */
   hasPendingRequest: import('vue').Ref<boolean>;
+  /** Hosted tools: reactive list of the current request's tool calls */
+  toolCalls: import('vue').Ref<ToolCall[]>;
+  /** Hosted tools: the model round the current request is on */
+  toolRound: import('vue').Ref<ToolRound | null>;
   /** Connect to WebSocket with token */
   connect: (options: ConnectOptions) => void;
   /** Disconnect from WebSocket */
   disconnect: () => void;
   /** Reset state and clear stored data */
   reset: () => void;
+  /** Hosted tools: ask ModelRiver to stop the request */
+  cancel: () => Promise<boolean>;
 }
 
 /**
@@ -455,12 +579,18 @@ export interface ModelRiverSvelteStore {
   error: import('svelte/store').Readable<string | null>;
   /** Readable store for pending request status */
   hasPendingRequest: import('svelte/store').Readable<boolean>;
+  /** Hosted tools: readable store for the current request's tool calls */
+  toolCalls: import('svelte/store').Readable<ToolCall[]>;
+  /** Hosted tools: readable store for the model round the request is on */
+  toolRound: import('svelte/store').Readable<ToolRound | null>;
   /** Connect to WebSocket with token */
   connect: (options: ConnectOptions) => void;
   /** Disconnect from WebSocket */
   disconnect: () => void;
   /** Reset state and clear stored data */
   reset: () => void;
+  /** Hosted tools: ask ModelRiver to stop the request */
+  cancel: () => Promise<boolean>;
 }
 
 
