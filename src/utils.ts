@@ -57,6 +57,12 @@ export const DEFAULT_TOKEN_REFRESH_INTERVAL = 120000;
 export const RESUMABLE_REQUEST_MAX_AGE_MS = 3600000;
 
 /**
+ * A request paused for tool approval stays resumable until its latest
+ * approval expires, plus this margin for the server to resume and answer.
+ */
+export const APPROVAL_RESUME_MARGIN_MS = 300000;
+
+/**
  * Close a Phoenix socket for good. `disconnect()` cancels Phoenix's pending
  * reconnect, but a teardown already in flight (after a heartbeat timeout, say)
  * can schedule another one afterwards, which would resend the socket's spent
@@ -192,17 +198,20 @@ export function saveActiveRequest(
   channelId: string,
   wsToken: string,
   websocketUrl?: string,
-  websocketChannel?: string
+  websocketChannel?: string,
+  extra: { timestamp?: number; approvalsUntil?: number | null } = {}
 ): void {
   if (!isStorageAvailable()) return;
 
   const request: ActiveRequest = {
     channelId,
     wsToken,
-    timestamp: Date.now(),
+    // When the token was issued: kept as is when only the approval deadline changes
+    timestamp: extra.timestamp ?? Date.now(),
     websocketUrl,
     websocketChannel,
   };
+  if (extra.approvalsUntil) request.approvalsUntil = extra.approvalsUntil;
 
   try {
     localStorage.setItem(
@@ -216,7 +225,8 @@ export function saveActiveRequest(
 
 /**
  * Get active request from localStorage
- * Returns null if not found or older than `maxAgeMs` (default 5 minutes)
+ * Returns null if not found or older than `maxAgeMs` (default 5 minutes),
+ * unless it waits for a tool approval that hasn't run out yet
  */
 export function getActiveRequest(
   prefix: string,
@@ -230,9 +240,12 @@ export function getActiveRequest(
 
     const request = JSON.parse(stored) as ActiveRequest;
 
-    // Drop requests older than maxAgeMs
+    // Drop requests older than maxAgeMs. A request paused for approval can
+    // wait up to an hour, so it is kept until its approvals run out.
     const age = Date.now() - request.timestamp;
-    if (age > maxAgeMs) {
+    const waitingForApproval =
+      typeof request.approvalsUntil === 'number' && Date.now() <= request.approvalsUntil;
+    if (age > maxAgeMs && !waitingForApproval) {
       clearActiveRequest(prefix);
       return null;
     }

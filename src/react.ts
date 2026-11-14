@@ -40,6 +40,7 @@ import type {
   AIResponse,
   ToolCall,
   ToolRound,
+  ToolApproval,
   UseModelRiverReturn,
 } from './types';
 
@@ -61,6 +62,7 @@ export function useModelRiver(
   const [streamText, setStreamText] = useState('');
   const [toolCalls, setToolCalls] = useState<ToolCall[]>([]);
   const [toolRound, setToolRound] = useState<ToolRound | null>(null);
+  const [pendingApprovals, setPendingApprovals] = useState<ToolApproval[]>([]);
 
   // Refs
   const clientRef = useRef<ModelRiverClient | null>(null);
@@ -139,6 +141,9 @@ export function useModelRiver(
       setToolRound(round);
     });
 
+    // Hosted tools: calls waiting for the end user's approval
+    const unsubApprovals = client.on('tool_approvals', setPendingApprovals);
+
     // Mount-time reconnect runs a tick later and is cancelled on unmount, so
     // StrictMode's mount -> unmount -> mount never spends the stored token twice
     let reconnectTimer: ReturnType<typeof setTimeout> | null = null;
@@ -181,6 +186,7 @@ export function useModelRiver(
       unsubStreamDelta();
       unsubStreamDone();
       unsubToolCalls();
+      unsubApprovals();
 
       if (reconnectTimer) clearTimeout(reconnectTimer);
 
@@ -205,6 +211,7 @@ export function useModelRiver(
     setStreamText('');
     setToolCalls([]);
     setToolRound(null);
+    setPendingApprovals([]);
     setHasPendingRequest(true);
 
     clientRef.current.connect(connectOptions);
@@ -230,6 +237,7 @@ export function useModelRiver(
     setStreamText('');
     setToolCalls([]);
     setToolRound(null);
+    setPendingApprovals([]);
     setHasPendingRequest(false);
   }, []);
 
@@ -250,6 +258,7 @@ export function useModelRiver(
     streamText,
     toolCalls,
     toolRound,
+    pendingApprovals,
     connect,
     disconnect,
     reset,

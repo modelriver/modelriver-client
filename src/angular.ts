@@ -45,6 +45,7 @@ import type {
   AIResponse,
   ToolCall,
   ToolRound,
+  ToolApproval,
 } from './types';
 
 /**
@@ -66,6 +67,7 @@ export class ModelRiverService {
   private hasPendingRequestSubject = new BehaviorSubject<boolean>(false);
   private toolCallsSubject = new BehaviorSubject<ToolCall[]>([]);
   private toolRoundSubject = new BehaviorSubject<ToolRound | null>(null);
+  private pendingApprovalsSubject = new BehaviorSubject<ToolApproval[]>([]);
 
   // Public observables
   readonly connectionState$: Observable<ConnectionState> = this.connectionStateSubject.asObservable();
@@ -77,6 +79,8 @@ export class ModelRiverService {
   readonly toolCalls$: Observable<ToolCall[]> = this.toolCallsSubject.asObservable();
   /** Hosted tools: the model round the current request is on */
   readonly toolRound$: Observable<ToolRound | null> = this.toolRoundSubject.asObservable();
+  /** Hosted tools: calls waiting for the end user's approval */
+  readonly pendingApprovals$: Observable<ToolApproval[]> = this.pendingApprovalsSubject.asObservable();
 
   // Convenience getters for current values
   get isConnected(): boolean {
@@ -170,6 +174,13 @@ export class ModelRiverService {
       })
     );
 
+    // Hosted tools: calls waiting for the end user's approval
+    this.unsubscribers.push(
+      this.client.on('tool_approvals', (approvals) => {
+        this.pendingApprovalsSubject.next(approvals);
+      })
+    );
+
     // Check for pending request on init
     // First check if workflow is already completed - if so, skip all reconnection logic
     const currentState = this.client.getState();
@@ -213,6 +224,7 @@ export class ModelRiverService {
     this.stepsSubject.next([]);
     this.toolCallsSubject.next([]);
     this.toolRoundSubject.next(null);
+    this.pendingApprovalsSubject.next([]);
     this.hasPendingRequestSubject.next(true);
 
     this.client.connect(options);
@@ -241,6 +253,7 @@ export class ModelRiverService {
     this.errorSubject.next(null);
     this.toolCallsSubject.next([]);
     this.toolRoundSubject.next(null);
+    this.pendingApprovalsSubject.next([]);
     this.hasPendingRequestSubject.next(false);
   }
 
@@ -265,6 +278,7 @@ export class ModelRiverService {
     this.hasPendingRequestSubject.complete();
     this.toolCallsSubject.complete();
     this.toolRoundSubject.complete();
+    this.pendingApprovalsSubject.complete();
   }
 
   private cleanup(): void {

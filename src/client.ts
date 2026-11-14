@@ -25,7 +25,12 @@ import type {
   ToolRoundStartedPayload,
   ToolCallStartedPayload,
   ToolCallCompletedPayload,
+  ToolCallStatus,
   ToolStatePayload,
+  ToolStateCall,
+  ToolApproval,
+  ToolApprovalRequiredPayload,
+  ToolApprovalResolvedPayload,
 } from './types';
 import {
   DEFAULT_BASE_URL,
@@ -36,6 +41,7 @@ import {
   DEFAULT_TOKEN_REFRESH_INTERVAL,
   LISTENING_TOKEN_USABLE_MS,
   RESUMABLE_REQUEST_MAX_AGE_MS,
+  APPROVAL_RESUME_MARGIN_MS,
   readInfo,
   retireSocket,
   saveActiveRequest,
@@ -104,6 +110,58 @@ function isOffline(): boolean {
   return typeof navigator !== 'undefined' && navigator.onLine === false;
 }
 
+/** The call status each approval decision leads to */
+const DECISION_STATUS: Record<string, ToolCallStatus> = {
+  approved: 'approved',
+  rejected: 'rejected',
+  expired: 'expired',
+};
+
+/** Statuses of a call that hasn't finished: stopped as `ended` when the request ends */
+const UNSETTLED_STATUSES = new Set<ToolCallStatus>(['running', 'awaiting_approval', 'approved']);
+
+/** A copy of JSON data, so a listener can't change the client's state through it */
+function copyJson<T>(value: T): T {
+  if (Array.isArray(value)) return value.map(copyJson) as T;
+  if (value !== null && typeof value === 'object') {
+    const copy: Record<string, unknown> = {};
+    for (const [key, item] of Object.entries(value)) copy[key] = copyJson(item);
+    return copy as T;
+  }
+  return value;
+}
+
+function copyApproval(approval: ToolApproval): ToolApproval {
+  return { ...approval, arguments: copyJson(approval.arguments) };
+}
+
+/** A pending approval from `tool_approval_required` or a `tool_state` call */
+function toApproval(
+  call: Partial<ToolApprovalRequiredPayload> & Pick<ToolApproval, 'id'>,
+  fallbackRound: number
+): ToolApproval {
+  const args = call.arguments;
+  return {
+    id: call.id,
+    name: call.name ?? '',
+    label: call.label ?? null,
+    round: call.round ?? fallbackRound,
+    prompt: typeof call.prompt === 'string' ? call.prompt : '',
+    arguments: args && typeof args === 'object' && !Array.isArray(args) ? copyJson(args) : {},
+    expires_at: call.expires_at ?? '',
+  };
+}
+
+/**
+ * A `tool_state` call as a `toolCalls` entry. What the approver sees stays in
+ * `pendingApprovals`, so a call looks the same whether the client saw it live
+ * or joined later.
+ */
+function toToolCall(call: ToolStateCall): ToolCall {
+  const { prompt: _prompt, arguments: _arguments, expires_at: _expiresAt, ...rest } = call;
+  return { ...rest };
+}
+
 /**
  * ModelRiver WebSocket Client
  * 
@@ -142,6 +200,14 @@ export class ModelRiverClient {
   private toolCalls: ToolCall[] = [];
   /** Hosted tools: the model round the request is on */
   private toolRound: ToolRound | null = null;
+  /** Hosted tools: calls waiting for the end user's approval. Memory only: never stored */
+  private pendingApprovals: ToolApproval[] = [];
+  /**
+   * While calls wait for approval: until when (ms) the request stays
+   * resumable (the latest `expires_at` plus a margin). A paused request can
+   * wait up to an hour, longer than the usual limits.
+   */
+  private approvalsUntil: number | null = null;
   private logger: ReturnType<typeof createLogger>;
 
   // Reconnection state
@@ -210,6 +276,7 @@ export class ModelRiverClient {
       streamText: this.streamText,
       toolCalls: this.toolCalls.map((call) => ({ ...call })),
       toolRound: this.toolRound ? { ...this.toolRound } : null,
+      pendingApprovals: this.pendingApprovals.map(copyApproval),
     };
   }
 
@@ -287,6 +354,7 @@ export class ModelRiverClient {
     this.retryAttempt = 0;
     this.fetchedTokenFailures = 0;
     this.unjoinedSince = Date.now();
+    this.approvalsUntil = null;
   }
 
   /**
@@ -465,7 +533,8 @@ export class ModelRiverClient {
     });
 
     // Hosted tools: progress while ModelRiver runs the workflow's tools. No
-    // arguments or results are sent, and the final `response` still follows.
+    // tool results are sent; arguments only for approvals (below). The final
+    // `response` still follows.
     channel.on('tool_round_started', (payload: ToolRoundStartedPayload) => {
       if (mine !== this.generation || !payload) return;
       this.toolRound = { round: payload.round, max_rounds: payload.max_rounds };
@@ -482,8 +551,11 @@ export class ModelRiverClient {
         round: payload.round,
         status: 'running',
       });
+      // A call that runs was decided, even if this client missed the decision
+      const dropped = this.dropApproval(payload.id);
       this.emit('tool_call_started', payload);
       this.emitToolCalls();
+      if (dropped) this.emitApprovals();
     });
 
     channel.on('tool_call_completed', (payload: ToolCallCompletedPayload) => {
@@ -496,18 +568,154 @@ export class ModelRiverClient {
         duration_ms: payload.duration_ms,
         user_message: payload.user_message ?? null,
       });
+      const dropped = this.dropApproval(payload.id);
       this.emit('tool_call_completed', payload);
       this.emitToolCalls();
+      if (dropped) this.emitApprovals();
     });
 
-    // Sent on join when the request is already under way: it replaces what
-    // the client had, which may be missing events from while it was away
+    // Hosted tools: a call that changes something waits for the end user.
+    // ModelRiver pauses the request until every such call of the round is
+    // approved, declined or expires. The prompt and the arguments the developer
+    // chose to show come with it, so the app can ask the user.
+    channel.on('tool_approval_required', (payload: ToolApprovalRequiredPayload) => {
+      if (mine !== this.generation || !payload?.id) return;
+      // A late or repeated message for a call already decided changes nothing
+      const current = this.toolCalls.find((call) => call.id === payload.id);
+      const applies = !current || current.status === 'awaiting_approval';
+      if (applies) {
+        const approval = toApproval(payload, this.toolRound?.round ?? 1);
+        this.upsertToolCall({
+          id: approval.id,
+          name: approval.name,
+          label: approval.label,
+          round: approval.round,
+          status: 'awaiting_approval',
+        });
+        this.upsertApproval(approval);
+      }
+      this.emit('tool_approval_required', payload);
+      if (applies) {
+        this.emitToolCalls();
+        this.emitApprovals();
+      }
+    });
+
+    channel.on('tool_approval_resolved', (payload: ToolApprovalResolvedPayload) => {
+      if (mine !== this.generation || !payload?.id) return;
+      // A decision this version doesn't know still means the call stopped
+      // waiting: show it as ended rather than leave it awaiting forever
+      const status = DECISION_STATUS[payload.decision] ?? 'ended';
+      // Only a call still waiting (or one this client never saw) takes the
+      // decision: a call that has already started keeps its own status
+      const current = this.toolCalls.find((call) => call.id === payload.id);
+      const applies = !current || current.status === 'awaiting_approval';
+      if (applies) {
+        this.upsertToolCall({ id: payload.id, name: payload.name, round: payload.round, status });
+      }
+      const dropped = this.dropApproval(payload.id);
+      this.emit('tool_approval_resolved', payload);
+      if (applies) this.emitToolCalls();
+      if (dropped) this.emitApprovals();
+    });
+
+    // Sent on join when the request is already under way (or paused for
+    // approval): where the calls it lists stand now. The client may have
+    // missed events while it was away
     channel.on('tool_state', (payload: ToolStatePayload) => {
       if (mine !== this.generation || !payload) return;
+      const calls = Array.isArray(payload.calls) ? payload.calls.filter(Boolean) : [];
+      const approvals = calls
+        .filter((call) => call.status === 'awaiting_approval' && call.id)
+        .map((call) => toApproval(call, payload.round));
+      const approvalsChanged = approvals.length > 0 || this.pendingApprovals.length > 0;
       this.toolRound = { round: payload.round, max_rounds: payload.max_rounds };
-      this.toolCalls = Array.isArray(payload.calls) ? payload.calls.map((call) => ({ ...call })) : [];
+      // The server keeps a call's progress for ten minutes, and the snapshot
+      // of a request paused for longer (or read on another server node) lists
+      // only the calls that needed approval. Calls this client saw finish
+      // stay; calls it still shows as in flight follow the snapshot.
+      // A call the server rebuilt from the request's log (an earlier round)
+      // has no progress label and no user message: keep the ones this client
+      // was sent while it ran.
+      const known = new Map(this.toolCalls.map((call) => [call.id, call]));
+      const snapshot = calls.map((call) => {
+        const next = toToolCall(call);
+        const had = known.get(next.id);
+        if (had && next.label == null && had.label != null) next.label = had.label;
+        if (had && next.user_message == null && had.user_message != null) next.user_message = had.user_message;
+        return next;
+      });
+      const listed = new Set(snapshot.map((call) => call.id));
+      const finished = this.toolCalls.filter(
+        (call) => !listed.has(call.id) && !UNSETTLED_STATUSES.has(call.status)
+      );
+      this.toolCalls = [...finished, ...snapshot];
+      this.pendingApprovals = approvals;
       this.emit('tool_state', payload);
       this.emitToolCalls();
+      if (approvalsChanged) {
+        this.emitApprovals();
+      } else {
+        // After a reload the deadline came from storage: the server's state replaces it
+        this.updateApprovalDeadline();
+      }
+    });
+  }
+
+  /** Add a pending approval, or replace the one with the same id */
+  private upsertApproval(approval: ToolApproval): void {
+    const index = this.pendingApprovals.findIndex((existing) => existing.id === approval.id);
+    this.pendingApprovals =
+      index === -1
+        ? [...this.pendingApprovals, approval]
+        : this.pendingApprovals.map((existing, i) => (i === index ? approval : existing));
+  }
+
+  /** Remove a pending approval. Returns true when there was one. */
+  private dropApproval(id: string): boolean {
+    const before = this.pendingApprovals.length;
+    this.pendingApprovals = this.pendingApprovals.filter((approval) => approval.id !== id);
+    return this.pendingApprovals.length !== before;
+  }
+
+  /**
+   * The client stopped following the request (a final connection failure or
+   * disconnect()). It will see no more decisions or outcomes, so it offers
+   * nothing to approve: a button left up would outlive the wait. The calls
+   * keep the status they had.
+   */
+  private dropAllApprovals(): void {
+    if (this.pendingApprovals.length === 0) return;
+    this.pendingApprovals = [];
+    this.emitApprovals();
+  }
+
+  private emitApprovals(): void {
+    this.updateApprovalDeadline();
+    this.emit('tool_approvals', this.pendingApprovals.map(copyApproval));
+  }
+
+  /**
+   * Keep the request resumable for as long as its approvals can still be
+   * decided, in memory and in storage (only the deadline is stored: never the
+   * prompt or the arguments)
+   */
+  private updateApprovalDeadline(): void {
+    const latest = Math.max(
+      ...this.pendingApprovals.map((approval) => Date.parse(approval.expires_at)).filter(Number.isFinite)
+    );
+    // Approval waits are at most an hour: a far-off time (a wrong clock) can't keep a request forever
+    const capped = Math.min(latest, Date.now() + RESUMABLE_REQUEST_MAX_AGE_MS);
+    this.approvalsUntil = Number.isFinite(capped) ? capped + APPROVAL_RESUME_MARGIN_MS : null;
+
+    if (!this.options.persist || !this.request || this.stopped) return;
+    const prefix = this.options.storageKeyPrefix;
+    const stored = getActiveRequest(prefix, Number.POSITIVE_INFINITY);
+    if (!stored || stored.channelId !== this.request.channelId) return;
+    // Same token and issue time: only the deadline changes
+    saveActiveRequest(prefix, stored.channelId, stored.wsToken, stored.websocketUrl, stored.websocketChannel, {
+      timestamp: stored.timestamp,
+      approvalsUntil: this.approvalsUntil,
     });
   }
 
@@ -537,30 +745,40 @@ export class ModelRiverClient {
 
   private clearToolCalls(): void {
     const had = this.toolCalls.length > 0 || this.toolRound !== null;
+    const hadApprovals = this.pendingApprovals.length > 0;
     this.toolCalls = [];
     this.toolRound = null;
+    this.pendingApprovals = [];
     if (had) this.emitToolCalls();
+    if (hadApprovals) this.emitApprovals();
   }
 
   /**
-   * The request ended. A call still shown as running finished without this
-   * client seeing it (events missed while reconnecting), so stop its spinner.
+   * The request ended. A call still shown as running, waiting for approval or
+   * approved finished without this client seeing it (events missed while
+   * reconnecting), so stop its spinner; nothing is waiting for approval any more.
    */
   private settleToolCalls(): void {
-    if (!this.toolCalls.some((call) => call.status === 'running')) return;
-    this.toolCalls = this.toolCalls.map((call) =>
-      call.status === 'running' ? { ...call, status: 'ended' } : call
-    );
-    this.emitToolCalls();
+    if (this.toolCalls.some((call) => UNSETTLED_STATUSES.has(call.status))) {
+      this.toolCalls = this.toolCalls.map((call) =>
+        UNSETTLED_STATUSES.has(call.status) ? { ...call, status: 'ended' } : call
+      );
+      this.emitToolCalls();
+    }
+    if (this.pendingApprovals.length > 0) {
+      this.pendingApprovals = [];
+      this.emitApprovals();
+    }
   }
 
   /**
    * Hosted tools: ask ModelRiver to stop the request this client is following.
    *
    * ModelRiver starts no further model round; a tool call already under way is
-   * left to finish. The final `response` then arrives as usual, with status
-   * "error" and `error.type` "cancelled", so keep listening for it. Rounds
-   * that already ran are still counted.
+   * left to finish. Calls waiting for approval are declined and never run.
+   * The final `response` then arrives as usual, with status "error" and
+   * `error.type` "cancelled", so keep listening for it. Rounds that already
+   * ran are still counted.
    *
    * Resolves true when the server took the request to stop, and false when
    * the client isn't joined to a request or the server doesn't support it.
@@ -677,9 +895,11 @@ export class ModelRiverClient {
     this.clearRetryTimer();
 
     // However retries fail (including a getToken that keeps throwing), stop once
-    // the client has gone this long without being joined
+    // the client has gone this long without being joined. A request paused
+    // for approval is kept until its approvals run out.
     const unjoinedSince = this.unjoinedSince ?? Date.now();
-    if (Date.now() - unjoinedSince >= RESUMABLE_REQUEST_MAX_AGE_MS) {
+    const waitingForApproval = this.approvalsUntil !== null && Date.now() <= this.approvalsUntil;
+    if (Date.now() - unjoinedSince >= RESUMABLE_REQUEST_MAX_AGE_MS && !waitingForApproval) {
       this.fail('Could not reconnect to the request within an hour');
       return;
     }
@@ -837,6 +1057,7 @@ export class ModelRiverClient {
     this.heldToken = null;
     this.isConnecting = false;
     this.connectionState = 'error';
+    this.dropAllApprovals();
 
     if (this.options.persist) {
       clearActiveRequest(this.options.storageKeyPrefix);
@@ -859,7 +1080,8 @@ export class ModelRiverClient {
       this.request.channelId,
       token,
       this.request.websocketUrl,
-      this.request.websocketChannel
+      this.request.websocketChannel,
+      { approvalsUntil: this.approvalsUntil }
     );
   }
 
@@ -1059,6 +1281,7 @@ export class ModelRiverClient {
     this.stopTimers();
     this.cleanupConnection();
     this.heldToken = null;
+    this.dropAllApprovals();
 
     if (this.options.persist) {
       clearActiveRequest(this.options.storageKeyPrefix);
@@ -1153,6 +1376,7 @@ export class ModelRiverClient {
       channelId: string;
       websocketUrl?: string;
       websocketChannel?: string;
+      approvalsUntil?: number;
     },
     freshToken?: string
   ): void {
@@ -1164,6 +1388,9 @@ export class ModelRiverClient {
       websocketUrl: activeRequest.websocketUrl,
       websocketChannel: activeRequest.websocketChannel,
     });
+    // After a reload: keep a request paused for approval resumable until the
+    // server's tool_state says where things stand
+    this.approvalsUntil = activeRequest.approvalsUntil ?? null;
 
     this.isConnecting = true;
     this.connectionState = 'connecting';
@@ -1227,6 +1454,7 @@ export class ModelRiverClient {
         channelId: activeRequest.channelId,
         websocketUrl: info.websocketUrl ?? info.websocket_url ?? activeRequest.websocketUrl,
         websocketChannel: topic ?? activeRequest.websocketChannel,
+        approvalsUntil: activeRequest.approvalsUntil,
       },
       token
     );

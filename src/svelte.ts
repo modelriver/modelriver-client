@@ -48,6 +48,7 @@ import type {
   AIResponse,
   ToolCall,
   ToolRound,
+  ToolApproval,
   ModelRiverSvelteStore,
 } from './types';
 
@@ -68,6 +69,7 @@ export function createModelRiver(
   const hasPendingRequestStore = writable<boolean>(false);
   const toolCallsStore = writable<ToolCall[]>([]);
   const toolRoundStore = writable<ToolRound | null>(null);
+  const pendingApprovalsStore = writable<ToolApproval[]>([]);
 
   // Derived stores for convenience
   const isConnectedStore = derived(
@@ -155,6 +157,13 @@ export function createModelRiver(
     })
   );
 
+  // Hosted tools: calls waiting for the end user's approval
+  unsubscribers.push(
+    client.on('tool_approvals', (approvals) => {
+      pendingApprovalsStore.set(approvals);
+    })
+  );
+
   // Check for pending request on init
   // First check if workflow is already completed - if so, skip all reconnection logic
   const currentState = client.getState();
@@ -187,6 +196,7 @@ export function createModelRiver(
     stepsStore.set([]);
     toolCallsStore.set([]);
     toolRoundStore.set(null);
+    pendingApprovalsStore.set([]);
     hasPendingRequestStore.set(true);
 
     client.connect(connectOptions);
@@ -216,6 +226,7 @@ export function createModelRiver(
     errorStore.set(null);
     toolCallsStore.set([]);
     toolRoundStore.set(null);
+    pendingApprovalsStore.set([]);
     hasPendingRequestStore.set(false);
   };
 
@@ -232,6 +243,7 @@ export function createModelRiver(
     hasPendingRequest: { subscribe: hasPendingRequestStore.subscribe } as Readable<boolean>,
     toolCalls: { subscribe: toolCallsStore.subscribe } as Readable<ToolCall[]>,
     toolRound: { subscribe: toolRoundStore.subscribe } as Readable<ToolRound | null>,
+    pendingApprovals: { subscribe: pendingApprovalsStore.subscribe } as Readable<ToolApproval[]>,
     connect,
     disconnect,
     reset,

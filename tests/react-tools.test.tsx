@@ -53,6 +53,7 @@ describe('useModelRiver: hosted tools and streaming', () => {
     expect(result.current.toolCalls).toEqual([]);
     expect(result.current.toolRound).toBeNull();
     expect(result.current.streamText).toBe('');
+    expect(result.current.pendingApprovals).toEqual([]);
     expect(typeof result.current.cancel).toBe('function');
   });
 
@@ -104,6 +105,44 @@ describe('useModelRiver: hosted tools and streaming', () => {
     expect(result.current.toolCalls).toEqual([]);
     expect(result.current.toolRound).toBeNull();
     expect(result.current.streamText).toBe('');
+  });
+
+  it('pendingApprovals follows the approval events and clears for the next request', () => {
+    const { result, channel } = mountAndJoin();
+    expect(result.current.pendingApprovals).toEqual([]);
+
+    const required = {
+      id: 'tc_w1',
+      name: 'cancel_order',
+      label: 'Cancelling the order…',
+      round: 1,
+      prompt: "Cancel this order? This can't be undone.",
+      arguments: { order_id: '1041' },
+      expires_at: '2026-11-14T10:20:00Z',
+    };
+    act(() => {
+      channel.simulateMessage('tool_approval_required', required);
+    });
+    expect(result.current.pendingApprovals).toEqual([required]);
+    expect(result.current.toolCalls).toEqual([
+      { id: 'tc_w1', name: 'cancel_order', label: 'Cancelling the order…', round: 1, status: 'awaiting_approval' },
+    ]);
+
+    act(() => {
+      channel.simulateMessage('tool_approval_resolved', { id: 'tc_w1', name: 'cancel_order', round: 1, decision: 'rejected' });
+    });
+    expect(result.current.pendingApprovals).toEqual([]);
+    expect(result.current.toolCalls[0]!.status).toBe('rejected');
+
+    act(() => {
+      channel.simulateMessage('tool_approval_required', { ...required, id: 'tc_w2' });
+    });
+    expect(result.current.pendingApprovals).toHaveLength(1);
+
+    act(() => {
+      result.current.connect({ channelId: 'chan-2', wsToken: 'second-token', websocketUrl: WS_URL });
+    });
+    expect(result.current.pendingApprovals).toEqual([]);
   });
 
   it('cancel() asks the server to stop', async () => {

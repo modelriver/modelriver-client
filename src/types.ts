@@ -303,6 +303,11 @@ export interface ActiveRequest {
   websocketUrl?: string;
   /** Full channel name to join */
   websocketChannel?: string;
+  /**
+   * Hosted tools: while calls wait for approval, the time (ms) until which the
+   * request stays resumable: the latest `expires_at` plus 5 minutes
+   */
+  approvalsUntil?: number;
 }
 
 /**
@@ -353,18 +358,37 @@ export interface StreamErrorPayload {
 /**
  * Where one tool call of a hosted-tools request stands.
  *
+ * - `awaiting_approval`: a tool that changes something, waiting for the end
+ *   user to approve or decline it (see `pendingApprovals`)
+ * - `approved`: approved, not started yet. ModelRiver runs it once every call
+ *   of the round has been decided. Set by the client.
+ * - `rejected`: declined (or the request was stopped while it waited); not run
+ * - `expired`: nobody decided in time; not run
  * - `running`: ModelRiver is calling your endpoint
  * - `ok`: the endpoint returned a result
  * - `error`: the call failed (the model is told, and may still answer)
  * - `timeout`: the endpoint did not answer in time
+ * - `unknown`: a tool that changes something was sent, but ModelRiver can't
+ *   tell whether it finished. It is never sent again; check before retrying.
  * - `ended`: the request finished before this client saw the call finish
  *   (for example after a reconnect); set by the client, never by the server
  */
-export type ToolCallStatus = 'running' | 'ok' | 'error' | 'timeout' | 'ended';
+export type ToolCallStatus =
+  | 'awaiting_approval'
+  | 'approved'
+  | 'rejected'
+  | 'expired'
+  | 'running'
+  | 'ok'
+  | 'error'
+  | 'timeout'
+  | 'unknown'
+  | 'ended';
 
 /**
- * One tool call, as shown to the end user. Arguments and results never reach
- * the browser.
+ * One tool call, as shown to the end user. Arguments and results stay out of
+ * this list; a call that needs approval shows the arguments the developer
+ * chose in `pendingApprovals` instead.
  */
 export interface ToolCall {
   /** Stable for the call, across retries and reconnects */
@@ -406,17 +430,67 @@ export interface ToolCallCompletedPayload {
   id: string;
   name: string;
   round: number;
-  status: 'ok' | 'error' | 'timeout';
+  /** `unknown`: a tool that changes something was sent, but the outcome isn't known */
+  status: 'ok' | 'error' | 'timeout' | 'unknown';
   duration_ms: number;
   user_message?: string | null;
 }
 
 /**
+ * A tool call that changes something, waiting for the end user's decision.
+ * The client can't approve it: send the decision to your backend, which calls
+ * `POST /v1/ai/tool-calls/:id/approve` (or `/reject`) with your API key.
+ */
+export interface ToolApproval {
+  /** The call id (`tc_…`); pass it to your backend */
+  id: string;
+  /** The tool's name */
+  name: string;
+  /** The tool's progress label from the console, if it has one */
+  label: string | null;
+  /** The model round the call belongs to (1-based) */
+  round: number;
+  /** The tool's approval prompt from the console ("Cancel this order? This can't be undone.") */
+  prompt: string;
+  /**
+   * Only the arguments the developer chose to show (approval fields), by
+   * name. The model wrote these values: render them as text, never as HTML.
+   */
+  arguments: Record<string, unknown>;
+  /** When ModelRiver stops waiting (ISO 8601); the call then becomes `expired` */
+  expires_at: string;
+}
+
+/** Sent when a tool call needs the end user's approval before it runs */
+export type ToolApprovalRequiredPayload = ToolApproval;
+
+/** How an approval ended */
+export type ToolApprovalDecision = 'approved' | 'rejected' | 'expired';
+
+/** Sent when a call that needed approval was approved, declined or expired */
+export interface ToolApprovalResolvedPayload {
+  id: string;
+  name: string;
+  round: number;
+  decision: ToolApprovalDecision;
+}
+
+/**
+ * One call in `tool_state`. A call awaiting approval also carries what the
+ * approver sees.
+ */
+export interface ToolStateCall extends ToolCall {
+  prompt?: string;
+  arguments?: Record<string, unknown>;
+  expires_at?: string;
+}
+
+/**
  * Sent once when the client joins (or rejoins) a hosted-tools request that is
- * already under way: where the request stands
+ * already under way, or paused for approval: where the request stands
  */
 export interface ToolStatePayload extends ToolRound {
-  calls: ToolCall[];
+  calls: ToolStateCall[];
 }
 
 /**
@@ -440,7 +514,10 @@ export type ModelRiverEventType =
   | 'tool_call_started'
   | 'tool_call_completed'
   | 'tool_state'
-  | 'tool_calls';
+  | 'tool_calls'
+  | 'tool_approval_required'
+  | 'tool_approval_resolved'
+  | 'tool_approvals';
 
 /**
  * Event listener callback types
@@ -475,6 +552,16 @@ export interface ModelRiverEventMap {
    * draw progress; the four events above are the raw messages behind it.
    */
   tool_calls: (calls: ToolCall[], round: ToolRound | null) => void;
+  /** Hosted tools: a call that changes something needs the end user's approval */
+  tool_approval_required: (data: ToolApprovalRequiredPayload) => void;
+  /** Hosted tools: a call that needed approval was approved, declined or expired */
+  tool_approval_resolved: (data: ToolApprovalResolvedPayload) => void;
+  /**
+   * Hosted tools: the list of calls waiting for approval changed. Receives
+   * every call still waiting. Listen to this one to show Approve and Decline
+   * buttons; the two events above are the raw messages behind it.
+   */
+  tool_approvals: (approvals: ToolApproval[]) => void;
 }
 
 /**
@@ -503,6 +590,8 @@ export interface ModelRiverState {
   toolCalls?: ToolCall[];
   /** Hosted tools: the model round the current request is on */
   toolRound?: ToolRound | null;
+  /** Hosted tools: calls waiting for the end user's approval, in the order they were asked */
+  pendingApprovals?: ToolApproval[];
 }
 
 /**
@@ -515,6 +604,8 @@ export interface UseModelRiverReturn extends ModelRiverState {
   toolCalls: ToolCall[];
   /** Hosted tools: the model round the current request is on */
   toolRound: ToolRound | null;
+  /** Hosted tools: calls waiting for the end user's approval */
+  pendingApprovals: ToolApproval[];
   /** Connect to WebSocket with token */
   connect: (options: ConnectOptions) => void;
   /** Disconnect from WebSocket */
@@ -551,6 +642,8 @@ export interface UseModelRiverVueReturn {
   toolCalls: import('vue').Ref<ToolCall[]>;
   /** Hosted tools: the model round the current request is on */
   toolRound: import('vue').Ref<ToolRound | null>;
+  /** Hosted tools: calls waiting for the end user's approval */
+  pendingApprovals: import('vue').Ref<ToolApproval[]>;
   /** Connect to WebSocket with token */
   connect: (options: ConnectOptions) => void;
   /** Disconnect from WebSocket */
@@ -583,6 +676,8 @@ export interface ModelRiverSvelteStore {
   toolCalls: import('svelte/store').Readable<ToolCall[]>;
   /** Hosted tools: readable store for the model round the request is on */
   toolRound: import('svelte/store').Readable<ToolRound | null>;
+  /** Hosted tools: readable store for the calls waiting for the end user's approval */
+  pendingApprovals: import('svelte/store').Readable<ToolApproval[]>;
   /** Connect to WebSocket with token */
   connect: (options: ConnectOptions) => void;
   /** Disconnect from WebSocket */

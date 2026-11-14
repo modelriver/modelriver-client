@@ -40,6 +40,7 @@ import type {
   AIResponse,
   ToolCall,
   ToolRound,
+  ToolApproval,
   UseModelRiverVueReturn,
 } from './types';
 
@@ -60,6 +61,7 @@ export function useModelRiver(
   const hasPendingRequest = ref(false);
   const toolCalls = ref<ToolCall[]>([]);
   const toolRound = ref<ToolRound | null>(null);
+  const pendingApprovals = ref<ToolApproval[]>([]);
   const isConnected = ref(false);
   const isConnecting = ref(false);
 
@@ -154,6 +156,13 @@ export function useModelRiver(
       })
     );
 
+    // Hosted tools: calls waiting for the end user's approval
+    unsubscribers.push(
+      client.on('tool_approvals', (approvals) => {
+        pendingApprovals.value = approvals;
+      })
+    );
+
     // Check for pending request on mount
     // First check if workflow is already completed - if so, skip all reconnection logic
     const currentState = client.getState();
@@ -209,6 +218,7 @@ export function useModelRiver(
     steps.value = [];
     toolCalls.value = [];
     toolRound.value = null;
+    pendingApprovals.value = [];
     hasPendingRequest.value = true;
 
     client.connect(connectOptions);
@@ -235,6 +245,7 @@ export function useModelRiver(
     error.value = null;
     toolCalls.value = [];
     toolRound.value = null;
+    pendingApprovals.value = [];
     hasPendingRequest.value = false;
   };
 
@@ -263,6 +274,7 @@ export function useModelRiver(
     hasPendingRequest,
     toolCalls,
     toolRound,
+    pendingApprovals,
     connect,
     disconnect,
     reset,
